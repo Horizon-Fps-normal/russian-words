@@ -7,14 +7,3 @@ release/
 !.env.example
 .DS_Store
 Thumbs.db
-
-# Android build artifacts & signing (keystore must never be uploaded)
-android/build/
-android/app/build/
-android/.gradle/
-android/local.properties
-android/app/src/main/assets/public/
-android/release-key.jks
-android/keystore.properties
-*.jks
-*.keystore

@@ -405,19 +405,6 @@ async function playGeneratedAudio(audioBase64) {
   return playAudioUrl(`data:audio/mpeg;base64,${audioBase64}`);
 }
 
-// 浏览器/PWA 环境下的神经语音：直接连接微软 Edge TTS（WebSocket），失败时回退系统语音
-async function speakWithEdgeWeb(text, speed = 0.82) {
-  const { EdgeTTS } = await import("edge-tts-universal/browser");
-  const tts = new EdgeTTS(cleanRussianText(text), "ru-RU-SvetlanaNeural", {
-    rate: `${Math.round((Number(speed) - 1) * 100)}%`,
-    volume: "+0%",
-    pitch: "+0Hz",
-  });
-  const result = await tts.synthesize();
-  const url = URL.createObjectURL(result.audio);
-  return playAudioUrl(url);
-}
-
 function getBrowserVoices() {
   const synth = window.speechSynthesis;
   const current = synth.getVoices();
@@ -462,11 +449,6 @@ async function speakRussian(text, speed = 0.82) {
     }
   } catch {
     // Fall back to the browser voice if Windows has no Russian voice installed.
-  }
-  try {
-    if (await speakWithEdgeWeb(cleanText, speed)) return;
-  } catch {
-    // Edge Web 不可用时回退到系统语音。
   }
   await speakWithBrowser(cleanText, speed);
 }
