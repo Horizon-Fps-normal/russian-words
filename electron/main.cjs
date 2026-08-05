@@ -61,20 +61,26 @@ function cleanRussianText(text) {
   return String(text || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 
-function getEdgeCachePath(text) {
-  const hash = createHash("sha256").update(text).digest("hex");
+function edgeRateForSpeed(speed) {
+  const value = Number.isFinite(Number(speed)) ? Number(speed) : 0.82;
+  return `${Math.round((value - 1) * 100)}%`;
+}
+
+function getEdgeCachePath(text, speed) {
+  const hash = createHash("sha256").update(`${text}|${speed}`).digest("hex");
   return path.join(app.getPath("userData"), "tts-cache", `${hash}.mp3`);
 }
 
-async function synthesizeWithEdgeTts(text) {
+async function synthesizeWithEdgeTts(text, speed) {
   const cleanText = cleanRussianText(text);
-  if (edgeAudioMemory.has(cleanText)) return edgeAudioMemory.get(cleanText);
+  const cacheKey = `${cleanText}|${speed}`;
+  if (edgeAudioMemory.has(cacheKey)) return edgeAudioMemory.get(cacheKey);
 
-  const cachePath = getEdgeCachePath(cleanText);
+  const cachePath = getEdgeCachePath(cleanText, speed);
   try {
     const cached = await readFile(cachePath);
     const base64 = cached.toString("base64");
-    edgeAudioMemory.set(cleanText, base64);
+    edgeAudioMemory.set(cacheKey, base64);
     return base64;
   } catch {
     // Generate and cache the word on first use.
@@ -83,7 +89,7 @@ async function synthesizeWithEdgeTts(text) {
   edgeTtsModulePromise ??= import("edge-tts-universal");
   const { EdgeTTS } = await edgeTtsModulePromise;
   const tts = new EdgeTTS(cleanText, "ru-RU-SvetlanaNeural", {
-    rate: "-10%",
+    rate: edgeRateForSpeed(speed),
     volume: "+0%",
     pitch: "+0Hz",
   });
@@ -92,15 +98,17 @@ async function synthesizeWithEdgeTts(text) {
   await mkdir(path.dirname(cachePath), { recursive: true });
   await writeFile(cachePath, audio);
   const base64 = audio.toString("base64");
-  edgeAudioMemory.set(cleanText, base64);
+  edgeAudioMemory.set(cacheKey, base64);
   return base64;
 }
 
-function speakWithWindowsVoice(text) {
+function speakWithWindowsVoice(text, speed) {
   if (process.platform !== "win32") return Promise.reject(new Error("Windows voice is unavailable"));
   if (speechProcess) speechProcess.kill();
 
   const encodedText = Buffer.from(String(text || ""), "utf8").toString("base64");
+  const value = Number.isFinite(Number(speed)) ? Number(speed) : 0.82;
+  const rate = Math.round((value - 1) * 10);
   const script = [
     "Add-Type -AssemblyName System.Speech",
     "$bytes = [Convert]::FromBase64String($env:RUSSIAN_WORD_TEXT)",
@@ -108,7 +116,7 @@ function speakWithWindowsVoice(text) {
     "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer",
     "$voice = $synth.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'ru-*' } | Select-Object -First 1",
     "if ($voice) { $synth.SelectVoice($voice.VoiceInfo.Name) }",
-    "$synth.Rate = 0",
+    `$synth.Rate = ${rate}`,
     "$synth.Volume = 100",
     "$synth.Speak($text)",
     "$synth.Dispose()",
@@ -132,12 +140,12 @@ function speakWithWindowsVoice(text) {
   });
 }
 
-ipcMain.handle("speak-russian", async (_event, text) => {
+ipcMain.handle("speak-russian", async (_event, text, speed) => {
   try {
-    return { provider: "edge-neural", audioBase64: await synthesizeWithEdgeTts(text) };
+    return { provider: "edge-neural", audioBase64: await synthesizeWithEdgeTts(text, speed) };
   } catch {
     try {
-      await speakWithWindowsVoice(text);
+      await speakWithWindowsVoice(text, speed);
       return { provider: "windows" };
     } catch {
       return { provider: "browser" };

@@ -78,7 +78,13 @@ h2 { font-size: 20px; letter-spacing: -.02em; }
 .review-topline > span:last-child { text-align: right; }
 .review-track { max-width: 1120px; height: 5px; margin: 18px auto 0; background: #e7e9eb; }
 .review-track span { display: block; width: 5%; height: 100%; background: #1758bd; }
-.quiz-shell { max-width: 1060px; margin: 86px auto 0; text-align: center; }
+.quiz-mode-switch { max-width: 1060px; margin: 26px auto 0; display: flex; justify-content: center; gap: 10px; }
+.quiz-mode-switch button { padding: 8px 18px; border: 1px solid #cdd5de; background: transparent; color: #7b8490; font-size: 13px; }
+.quiz-mode-switch button.active { color: var(--blue); background: var(--blue-soft); border-color: #b9cbe8; font-weight: 700; }
+.quiz-shell { max-width: 1060px; margin: 60px auto 0; text-align: center; }
+.quiz-shell.empty-queue { padding-top: 60px; }
+.quiz-shell.empty-queue p { margin-top: 14px; color: var(--muted); }
+.quiz-shell.empty-queue .primary-button { margin-top: 32px; }
 .study-detail-shell { max-width: 860px; margin: 68px auto 0; text-align: left; }
 .study-result { display: flex; align-items: center; gap: 16px; margin-bottom: 26px; padding: 15px 18px; font-size: 14px; }
 .study-result strong { font-size: 16px; }
@@ -107,11 +113,6 @@ h2 { font-size: 20px; letter-spacing: -.02em; }
 .answer-option.correct { color: #197252; background: #eef8f3; }
 .answer-option.wrong { color: #a84949; background: #fdf0f0; }
 .answer-option.muted { color: #a6adb5; }
-.answer-feedback { display: flex; align-items: center; justify-content: center; gap: 18px; margin-top: 25px; padding: 16px; font-size: 14px; }
-.answer-feedback.success { color: #187152; background: #eef8f3; }
-.answer-feedback.error { color: #a84949; background: #fdf0f0; }
-.answer-feedback span { color: inherit; opacity: .8; }
-.answer-feedback button { color: inherit; background: transparent; font-weight: 700; margin-left: 10px; }
 
 .library-heading { display: flex; justify-content: space-between; align-items: end; margin-bottom: 35px; }
 .library-heading h1 { margin-top: 12px; }
@@ -158,9 +159,41 @@ h2 { font-size: 20px; letter-spacing: -.02em; }
 .detail-footer { display: flex; align-items: center; gap: 14px; padding-top: 30px; }
 .add-button { display: inline-flex; align-items: center; gap: 10px; min-width: 205px; justify-content: center; }
 .add-button.added { background: #197252; }
+.add-button:disabled { opacity: .7; cursor: default; transform: none; }
 
 .history-page h1, .settings-page h1 { margin-top: 14px; }
 .intro-copy { margin-top: 14px; color: var(--muted); }
+
+.grammar-heading { margin-bottom: 30px; }
+.grammar-heading h1 { margin-top: 12px; }
+.grammar-intro { margin-top: 11px; color: var(--muted); font-size: 14px; }
+.grammar-tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--line); margin-bottom: 34px; }
+.grammar-tab { padding: 11px 20px; background: transparent; color: #6d7783; font-size: 14px; border-bottom: 3px solid transparent; }
+.grammar-tab.active { color: var(--blue); border-bottom-color: var(--blue); font-weight: 700; }
+.grammar-section { padding: 8px 0 34px; }
+.grammar-section h2 { margin-bottom: 10px; }
+.grammar-section h3.grammar-paradigm-title { margin: 26px 0 14px; font-size: 16px; color: #36424e; }
+.grammar-note { color: var(--muted); font-size: 14px; line-height: 1.7; margin-bottom: 22px; max-width: 760px; }
+.grammar-table { width: 100%; max-width: 860px; border-collapse: collapse; margin-bottom: 22px; }
+.grammar-table th, .grammar-table td { border: 1px solid var(--line); padding: 9px 14px; text-align: left; font-size: 14px; }
+.grammar-table thead th { background: #f4f6f8; color: #5c6672; font-weight: 700; font-size: 13px; }
+.grammar-table tbody th { color: #5c6672; font-weight: 600; white-space: nowrap; }
+.grammar-case-name small { display: block; color: #9aa2ab; font-weight: 400; font-size: 12px; margin-top: 3px; }
+.grammar-form { font-family: Georgia, "Times New Roman", serif; font-size: 17px; color: #222a33; }
+.grammar-table td .audio-button { margin-left: 10px; vertical-align: middle; }
+.grammar-person { font-family: Georgia, "Times New Roman", serif; font-weight: 400; }
+.grammar-ask { color: var(--blue); font-weight: 600; }
+.grammar-example { display: block; margin-top: 8px; font-size: 12px; line-height: 1.6; max-width: 360px; font-weight: 400; }
+.grammar-example-ru { color: #3d4650; font-family: Georgia, "Times New Roman", serif; font-size: 13px; }
+.grammar-example-zh { color: #89939e; display: block; margin-top: 2px; font-size: 12px; }
+.grammar-table .grammar-example .audio-button { margin-left: 6px; vertical-align: middle; }
+.pronoun-table th small { display: block; color: #9aa2ab; font-weight: 400; font-size: 12px; margin-top: 3px; }
+.grammar-search { margin-bottom: 26px; max-width: 620px; }
+.grammar-result-heading { display: flex; align-items: center; gap: 12px; margin: 4px 0 18px; }
+.grammar-result-heading h3 { margin: 0; font-size: 24px; font-family: Georgia, "Times New Roman", serif; font-weight: 400; }
+.conjugation-blocks { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px 34px; max-width: 960px; }
+.conjugation-block h4 { margin: 0 0 12px; color: #36424e; font-size: 15px; }
+.case-overview { max-width: 860px; }
 .history-summary { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 60px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .history-summary div { display: grid; gap: 8px; padding: 28px 0; }
 .history-summary div + div { padding-left: 30px; border-left: 1px solid var(--line); }
@@ -180,7 +213,7 @@ h2 { font-size: 20px; letter-spacing: -.02em; }
 .settings-list label span:first-child { display: grid; gap: 8px; }
 .settings-list small { color: var(--muted); font-size: 13px; }
 .settings-list select { min-width: 118px; padding: 9px 12px; border: 1px solid #cdd4db; color: var(--ink); background: transparent; }
-.toggle { width: 39px; height: 23px; padding: 3px; display: block; background: #ced4db; border-radius: 20px; }
+.toggle { width: 39px; height: 23px; padding: 3px; display: block; background: #ced4db; border-radius: 20px; border: 0; cursor: pointer; }
 .toggle span { display: block; width: 17px; height: 17px; background: white; border-radius: 50%; transition: transform .18s; }
 .toggle.on { background: var(--blue); }
 .toggle.on span { transform: translateX(16px); }
