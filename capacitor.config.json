@@ -1,0 +1,12 @@
+{
+  "appId": "com.russianwords.android",
+  "appName": "俄语单词",
+  "webDir": "dist/client",
+  "plugins": {
+    "StatusBar": {
+      "overlaysWebView": true,
+      "style": "DARK",
+      "backgroundColor": "#00000000"
+    }
+  }
+}

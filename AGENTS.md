@@ -10,9 +10,12 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 
 ## Product direction
 
-- The deliverable is a Windows desktop application, not a web product. The Vite page is only the local UI layer used by the Electron desktop shell and for Sites compatibility.
+- The product has two local application targets: the existing Windows desktop application and an Android application. The Vite page is the shared local UI layer used by the Electron desktop shell, the Capacitor Android shell, and Sites compatibility; it is not primarily a web product.
+- The Android UI must be a substantial Material 3 mobile redesign rather than a scaled desktop layout. Target Redmi K80-class portrait screens first (360-430dp logical width), respect system bars and gesture insets, and keep all learning content and functional scope available.
+- Preserve the existing Windows/Electron build while adding Android; do not remove `.openai/hosting.json`, the Sites worker/build preparation, or their tests.
 - Preserve the primary Russian-to-Chinese learning flow and keep listening discrimination as a secondary mode.
-- Daily study goal is a milestone, not a cap: after reaching the daily quota the user can keep studying ("继续学习") and every learned word is still recorded. Study records, settings, and today-added words persist locally in localStorage.
+- Daily study goal is a milestone, not a cap: after reaching the daily quota the user can keep studying ("继续学习") and every learned word is still recorded. Study records, settings, and date-scoped today-added words persist in platform-local storage (desktop may retain the existing localStorage compatibility path).
 - Review uses spaced repetition (1/3/7/14/30/90 day stages); a correct review answer advances the stage, a wrong one resets it.
 - Study pool = local words + OpenRussian words with Chinese glosses (`russian-chinese-core.json` 315 + `russian-chinese-extra.json` 800, merged by `scripts/add-chinese-glosses.mjs`), sorted A1→C1. Example sentences come from `russian-examples.json` (fetched from openrussian.org by `scripts/fetch-examples.mjs`, with Chinese translations). Grammar tables (declensions/conjugations, incl. pronouns) come from `russian-grammar.json` (fetched by `scripts/fetch-grammar.mjs`). Lookup/examples/grammar data are lazy-loaded chunks.
-- Product scope is Windows desktop only (Electron). Android/Capacitor/PWA support was removed; TTS always goes through the desktop IPC (Edge TTS in the main process).
+- Use a platform adapter for device-specific capabilities. Windows TTS continues through desktop IPC (Edge TTS in the main process); Android uses its native/Capacitor speech, persistence, media-picker, system-bar, back-navigation, and haptics paths with safe web fallbacks.
+- Keep temporary Android SDK, JDK, Gradle caches, downloads, and disposable build artifacts under `D:\software(other)\russia\russian-words-0.2.0\codex_shit` whenever tooling permits.

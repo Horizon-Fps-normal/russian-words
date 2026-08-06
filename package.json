@@ -10,12 +10,32 @@
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
+    "test:core": "node --test tests/core-logic.test.mjs",
+    "test:data": "node --test tests/lookup-data.test.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs",
     "data:import": "node scripts/import-open-russian.mjs",
+    "data:import-wikdict": "node scripts/import-wikdict-ru-zh.mjs",
+    "data:fetch-ruwiktionary": "node scripts/fetch-ruwiktionary-definitions.mjs",
+    "data:fetch-enwiktionary": "node scripts/fetch-enwiktionary-fallbacks.mjs",
+    "data:complete-glosses": "node scripts/complete-lookup-glosses.mjs",
+    "data:audit-glosses": "node scripts/audit-lookup-glosses.mjs",
+    "data:rebuild-glosses": "node scripts/rebuild-lookup-glosses.mjs --apply",
+    "data:audit-quality": "node scripts/audit-lookup-quality.mjs",
     "desktop:dev": "node scripts/desktop-dev.mjs",
-    "desktop:build": "npm run build && electron-builder --win nsis"
+    "desktop:build": "npm run build && electron-builder --win nsis",
+    "android:sync": "npm run build && cap sync android",
+    "android:open": "cap open android",
+    "android:build": "npm run android:sync && node scripts/android-build.mjs debug",
+    "android:debug": "npm run android:build",
+    "android:release": "npm run android:sync && node scripts/android-build.mjs release"
   },
   "dependencies": {
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/core": "^8.5.0",
+    "@capacitor/haptics": "^8.0.2",
+    "@capacitor/preferences": "^8.0.1",
+    "@capacitor/status-bar": "^8.0.3",
     "@phosphor-icons/react": "^2.1.10",
     "@vitejs/plugin-react": "5.0.4",
     "edge-tts-universal": "^1.4.0",
@@ -24,6 +44,7 @@
     "vite": "6.4.2"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.5.0",
     "electron": "^37.2.6",
     "electron-builder": "^26.0.12"
   },

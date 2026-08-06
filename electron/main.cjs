@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, session } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, session, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const { createHash } = require("node:crypto");
 const { mkdir, readFile, unlink, writeFile } = require("node:fs/promises");
@@ -6,6 +6,7 @@ const path = require("node:path");
 
 const isDev = Boolean(process.env.ELECTRON_START_URL);
 let speechProcess = null;
+let speechRequestSerial = 0;
 const edgeAudioMemory = new Map();
 let edgeTtsModulePromise;
 const backgroundDirectoryName = "background";
@@ -62,7 +63,7 @@ function cleanRussianText(text) {
 }
 
 function edgeRateForSpeed(speed) {
-  const value = Number.isFinite(Number(speed)) ? Number(speed) : 0.82;
+  const value = Number.isFinite(Number(speed)) ? Number(speed) : 1;
   return `${Math.round((value - 1) * 100)}%`;
 }
 
@@ -107,14 +108,17 @@ function speakWithWindowsVoice(text, speed) {
   if (speechProcess) speechProcess.kill();
 
   const encodedText = Buffer.from(String(text || ""), "utf8").toString("base64");
-  const value = Number.isFinite(Number(speed)) ? Number(speed) : 0.82;
+  const value = Number.isFinite(Number(speed)) ? Number(speed) : 1;
   const rate = Math.round((value - 1) * 10);
   const script = [
     "Add-Type -AssemblyName System.Speech",
     "$bytes = [Convert]::FromBase64String($env:RUSSIAN_WORD_TEXT)",
     "$text = [Text.Encoding]::UTF8.GetString($bytes)",
     "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer",
-    "$voice = $synth.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'ru-*' } | Select-Object -First 1",
+    "$voices = $synth.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'ru-*' }",
+    "$voice = $voices | Where-Object { $_.VoiceInfo.Gender -eq 'Female' -and $_.VoiceInfo.Name -match 'Svetlana|Dariya|Irina|Alena|Milena|Katya|Tatyana' } | Select-Object -First 1",
+    "if (-not $voice) { $voice = $voices | Where-Object { $_.VoiceInfo.Gender -eq 'Female' } | Select-Object -First 1 }",
+    "if (-not $voice) { $voice = $voices | Select-Object -First 1 }",
     "if ($voice) { $synth.SelectVoice($voice.VoiceInfo.Name) }",
     `$synth.Rate = ${rate}`,
     "$synth.Volume = 100",
@@ -140,14 +144,37 @@ function speakWithWindowsVoice(text, speed) {
   });
 }
 
+function stopNativeSpeech() {
+  speechRequestSerial += 1;
+  if (speechProcess) {
+    speechProcess.kill();
+    speechProcess = null;
+  }
+}
+
+ipcMain.handle("stop-russian", () => {
+  stopNativeSpeech();
+  return true;
+});
+
 ipcMain.handle("speak-russian", async (_event, text, speed) => {
+  const requestId = ++speechRequestSerial;
+  if (speechProcess) {
+    speechProcess.kill();
+    speechProcess = null;
+  }
   try {
-    return { provider: "edge-neural", audioBase64: await synthesizeWithEdgeTts(text, speed) };
+    const audioBase64 = await synthesizeWithEdgeTts(text, speed);
+    if (requestId !== speechRequestSerial) return { provider: "cancelled" };
+    return { provider: "edge-neural", audioBase64 };
   } catch {
+    if (requestId !== speechRequestSerial) return { provider: "cancelled" };
     try {
       await speakWithWindowsVoice(text, speed);
+      if (requestId !== speechRequestSerial) return { provider: "cancelled" };
       return { provider: "windows" };
     } catch {
+      if (requestId !== speechRequestSerial) return { provider: "cancelled" };
       return { provider: "browser" };
     }
   }
@@ -175,7 +202,14 @@ function createWindow() {
   });
 
   window.once("ready-to-show", () => window.show());
-  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      if (new URL(url).protocol === "https:") void shell.openExternal(url);
+    } catch {
+      // Malformed or non-web links remain blocked inside the app.
+    }
+    return { action: "deny" };
+  });
   window.webContents.on("will-navigate", (event, url) => {
     if (isDev && url.startsWith(process.env.ELECTRON_START_URL)) return;
     event.preventDefault();

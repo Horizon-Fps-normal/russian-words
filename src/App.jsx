@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpen,
+  BookOpenText,
   Books,
   ChartLineUp,
   Check,
@@ -12,8 +13,48 @@ import {
   Repeat,
   SpeakerHigh,
   SquaresFour,
+  CaretRight,
+  UserCircle,
   X,
 } from "@phosphor-icons/react";
+import {
+  SCHEMA_VERSION,
+  STORAGE_KEYS as CORE_STORAGE_KEYS,
+  addWordForToday,
+  buildDictionary as buildCoreDictionary,
+  buildExampleWordIndex,
+  buildReadingWordIndex,
+  buildLearnQueue as buildCoreLearnQueue,
+  buildReviewQueue as buildCoreReviewQueue,
+  buildStudyPool as buildCoreStudyPool,
+  completeSessionWord,
+  createOptions,
+  getHistoryDays as getCoreHistoryDays,
+  getHistoryStats as getCoreHistoryStats,
+  getTodayStats as getCoreTodayStats,
+  hydrateSessionQueue,
+  loadCoreState,
+  normalizeAddedToday,
+  normalizeRecord,
+  normalizeSession,
+  normalizeSettings,
+  paginateItems,
+  recordAnswer,
+  removeRussianStress,
+  resolveReadingWord,
+  splitRussianText,
+  createReadingSpeechController,
+} from "./core/index.js";
+import ReadingView from "./components/ReadingView.jsx";
+import readingTexts from "./data/reading-texts.js";
+import {
+  background as platformBackground,
+  haptics,
+  isAndroid,
+  speech as platformSpeech,
+  storage as platformStorage,
+  system,
+} from "./platform/index.js";
 
 const WORDS = [
   {
@@ -176,6 +217,7 @@ function getFormItems(word) {
 const NAV_ITEMS = [
   { id: "today", label: "今日学习", Icon: House },
   { id: "review", label: "复习单词", Icon: SquaresFour },
+  { id: "reading", label: "阅读", Icon: BookOpenText },
   { id: "grammar", label: "俄语语法", Icon: Books },
   { id: "library", label: "词库", Icon: BookOpen },
   { id: "history", label: "学习记录", Icon: ChartLineUp },
@@ -187,7 +229,7 @@ const STUDY_SETTINGS_KEY = "russian-words-settings";
 const STUDY_RECORD_KEY = "russian-words-record";
 const ADDED_TODAY_KEY = "russian-words-added-today";
 
-const DEFAULT_SETTINGS = { dailyGoal: 20, speed: 0.82, listenEnabled: true };
+const DEFAULT_SETTINGS = { dailyGoal: 20, speed: 1, speedProfileVersion: 2, listenEnabled: true };
 
 function dateKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
@@ -207,13 +249,7 @@ function getStoredJson(key, fallback) {
 }
 
 function getStoredSettings() {
-  const stored = getStoredJson(STUDY_SETTINGS_KEY, null);
-  if (!stored || typeof stored !== "object") return DEFAULT_SETTINGS;
-  return {
-    dailyGoal: [10, 20, 30].includes(Number(stored.dailyGoal)) ? Number(stored.dailyGoal) : DEFAULT_SETTINGS.dailyGoal,
-    speed: [0.7, 0.82, 1].includes(Number(stored.speed)) ? Number(stored.speed) : DEFAULT_SETTINGS.speed,
-    listenEnabled: stored.listenEnabled !== false,
-  };
+  return normalizeSettings(getStoredJson(STUDY_SETTINGS_KEY, null));
 }
 
 function getStoredStudyProgress() {
@@ -225,17 +261,15 @@ function getStoredStudyProgress() {
 }
 
 function getStoredRecord() {
-  const stored = getStoredJson(STUDY_RECORD_KEY, null);
-  return { words: stored?.words && typeof stored.words === "object" ? stored.words : {} };
+  return normalizeRecord(getStoredJson(STUDY_RECORD_KEY, null));
 }
 
 function getStoredAddedToday() {
-  const stored = getStoredJson(ADDED_TODAY_KEY, []);
-  return Array.isArray(stored) ? stored.filter((id) => typeof id === "string") : [];
+  return normalizeAddedToday(getStoredJson(ADDED_TODAY_KEY, []), todayKey());
 }
 
 function cleanRussianText(text) {
-  return String(text || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return removeRussianStress(text);
 }
 
 function shuffled(items) {
@@ -389,20 +423,56 @@ function relativeDay(dateKey) {
 }
 
 let activeAudio = null;
+let activeAudioFinish = null;
+let activeBrowserFinish = null;
+let speechRequestSerial = 0;
 
-function playAudioUrl(url) {
-  if (activeAudio) {
-    activeAudio.pause();
-    activeAudio.removeAttribute("src");
-  }
-  activeAudio = new Audio(url);
-  activeAudio.volume = 1;
-  return activeAudio.play().then(() => true).catch(() => false);
+function stopActiveAudio() {
+  if (!activeAudio) return;
+  const audio = activeAudio;
+  const finish = activeAudioFinish;
+  activeAudio = null;
+  activeAudioFinish = null;
+  audio.pause();
+  audio.removeAttribute("src");
+  audio.load();
+  finish?.(false);
 }
 
-async function playGeneratedAudio(audioBase64) {
+function stopBrowserSpeech() {
+  const finish = activeBrowserFinish;
+  activeBrowserFinish = null;
+  window.speechSynthesis?.cancel();
+  finish?.(false);
+}
+
+function playAudioUrl(url, requestId) {
+  if (requestId !== speechRequestSerial) return Promise.resolve(false);
+  stopActiveAudio();
+  const audio = new Audio(url);
+  activeAudio = audio;
+  audio.volume = 1;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (played) => {
+      if (settled) return;
+      settled = true;
+      if (activeAudio === audio) {
+        activeAudio = null;
+        activeAudioFinish = null;
+      }
+      resolve(Boolean(played && requestId === speechRequestSerial));
+    };
+    activeAudioFinish = finish;
+    audio.onended = () => finish(true);
+    audio.onerror = () => finish(false);
+    audio.play().catch(() => finish(false));
+  });
+}
+
+async function playGeneratedAudio(audioBase64, requestId) {
   if (!audioBase64) return false;
-  return playAudioUrl(`data:audio/mpeg;base64,${audioBase64}`);
+  return playAudioUrl(`data:audio/mpeg;base64,${audioBase64}`, requestId);
 }
 
 function getBrowserVoices() {
@@ -422,38 +492,92 @@ function getBrowserVoices() {
   });
 }
 
-async function speakWithBrowser(text, speed = 0.82) {
-  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+async function speakWithBrowser(text, speed = 1, requestId = speechRequestSerial) {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return false;
   const synth = window.speechSynthesis;
   const voices = await getBrowserVoices();
-  synth.cancel();
+  if (requestId !== speechRequestSerial) return false;
+  const russianVoices = voices.filter((voice) => voice.lang?.toLowerCase().startsWith("ru"));
+  const russianVoice = russianVoices.find((voice) => /svetlana|dariya|irina|alena|milena|katya|tatyana/i.test(voice.name))
+    || russianVoices.find((voice) => !/dmitry|maxim|pavel|alexander|yuri/i.test(voice.name))
+    || russianVoices[0];
+  if (!russianVoice) return false;
+  stopBrowserSpeech();
   const utterance = new SpeechSynthesisUtterance(cleanRussianText(text));
-  const russianVoice = voices.find((voice) => voice.lang?.toLowerCase().startsWith("ru"));
-  if (russianVoice) utterance.voice = russianVoice;
+  utterance.voice = russianVoice;
   utterance.lang = "ru-RU";
-  utterance.rate = speed;
+  utterance.rate = Math.max(0.7, Math.min(1.3, speed));
+  utterance.pitch = 1;
   utterance.volume = 1;
-  synth.speak(utterance);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (played) => {
+      if (settled) return;
+      settled = true;
+      if (activeBrowserFinish === finish) activeBrowserFinish = null;
+      resolve(Boolean(played && requestId === speechRequestSerial));
+    };
+    activeBrowserFinish = finish;
+    utterance.onend = () => finish(true);
+    utterance.onerror = () => finish(false);
+    synth.speak(utterance);
+  });
 }
 
-async function speakRussian(text, speed = 0.82) {
-  const cleanText = cleanRussianText(text);
+async function stopRussianSpeech() {
+  speechRequestSerial += 1;
+  stopActiveAudio();
+  stopBrowserSpeech();
   try {
+    await platformSpeech.stop();
+  } catch {
+    // Cancellation remains best-effort while a native provider is starting.
+  }
+}
+
+async function speakRussian(text, speed = 1) {
+  const cleanText = cleanRussianText(text);
+  const requestId = ++speechRequestSerial;
+  stopActiveAudio();
+  stopBrowserSpeech();
+  try {
+    await platformSpeech.stop();
+  } catch {
+    // Stopping is best-effort on devices whose TTS engine is still starting.
+  }
+  if (requestId !== speechRequestSerial) return false;
+  try {
+    if (isAndroid) {
+      const played = await platformSpeech.speakRussian(cleanText, speed);
+      if (requestId !== speechRequestSerial) return false;
+      if (played) return true;
+    }
     if (window.desktopApp?.speakRussian) {
       const result = await window.desktopApp.speakRussian(cleanText, speed);
+      if (requestId !== speechRequestSerial || result?.provider === "cancelled") return false;
       if (result?.audioBase64) {
-        await playGeneratedAudio(result.audioBase64);
-        return;
+        return playGeneratedAudio(result.audioBase64, requestId);
       }
-      if (result?.provider === "windows") return;
+      if (result?.provider === "windows") return true;
     }
   } catch {
     // Fall back to the browser voice if Windows has no Russian voice installed.
   }
-  await speakWithBrowser(cleanText, speed);
+  if (requestId !== speechRequestSerial) return false;
+  const played = await speakWithBrowser(cleanText, speed, requestId);
+  if (requestId !== speechRequestSerial) return false;
+  if (!played) window.dispatchEvent(new Event("russian-tts-unavailable"));
+  return played;
 }
 
 function Nav({ active, onChange, goal }) {
+  const mobileItems = [
+    { id: "today", label: "今日", Icon: House },
+    { id: "library", label: "词库", Icon: BookOpen },
+    { id: "reading", label: "阅读", Icon: BookOpenText },
+    { id: "grammar", label: "语法", Icon: Books },
+    { id: "profile", label: "我的", Icon: UserCircle },
+  ];
   return (
     <aside className="sidebar">
       <div className="brand">
@@ -463,7 +587,7 @@ function Nav({ active, onChange, goal }) {
           <span>给中文使用者</span>
         </div>
       </div>
-      <nav className="nav-list" aria-label="主导航">
+      <nav className="nav-list desktop-nav" aria-label="主导航">
         {NAV_ITEMS.map(({ id, label, Icon }) => (
           <button className={`nav-item ${active === id ? "active" : ""}`} key={id} onClick={() => onChange(id)}>
             <Icon size={21} weight={active === id ? "fill" : "regular"} />
@@ -471,12 +595,20 @@ function Nav({ active, onChange, goal }) {
           </button>
         ))}
       </nav>
-      <div className="sidebar-footnote">A1 — B2 · 每天 {goal} 词</div>
+      <nav className="nav-list mobile-nav" aria-label="底部导航">
+        {mobileItems.map(({ id, label, Icon }) => (
+          <button className={`nav-item ${active === id ? "active" : ""}`} key={id} onClick={() => onChange(id)}>
+            <Icon size={23} weight={active === id ? "fill" : "regular"} />
+            <span>{label}</span>
+          </button>
+        ))}
+      </nav>
+      <div className="sidebar-footnote">A1 – C1 · 每天 {goal} 词</div>
     </aside>
   );
 }
 
-function AudioButton({ word, compact = false, text, className = "", speed = 0.82 }) {
+function AudioButton({ word, compact = false, text, className = "", speed = 1 }) {
   const spokenText = text || word?.stressed || "";
   const label = text || word?.word || "俄语内容";
   return (
@@ -490,6 +622,95 @@ function AudioButton({ word, compact = false, text, className = "", speed = 0.82
     >
       <SpeakerHigh size={compact ? 17 : 21} weight="regular" />
     </button>
+  );
+}
+
+const CLOSE_EXAMPLE_POPOVER_EVENT = "russian-words:close-example-popover";
+const EXAMPLE_POPOVER_BACK_GUARD_MS = 300;
+let lastExamplePopoverCloseAt = Number.NEGATIVE_INFINITY;
+
+function markExamplePopoverClosed() {
+  lastExamplePopoverCloseAt = Date.now();
+}
+
+function wasExamplePopoverJustClosed() {
+  return Date.now() - lastExamplePopoverCloseAt < EXAMPLE_POPOVER_BACK_GUARD_MS;
+}
+
+function InteractiveExample({ text, wordIndex, speed = 1, className = "" }) {
+  const [selected, setSelected] = useState(null);
+  const rootRef = useRef(null);
+  const parts = useMemo(() => splitRussianText(text), [text]);
+
+  useEffect(() => {
+    const closeOutside = (event) => {
+      if (!rootRef.current?.contains(event.target)) setSelected(null);
+    };
+    const closeOnViewportChange = () => setSelected(null);
+    const closeFromBackIntent = () => setSelected(null);
+    document.addEventListener("pointerdown", closeOutside);
+    window.addEventListener("resize", closeOnViewportChange);
+    window.addEventListener("scroll", closeOnViewportChange, true);
+    window.addEventListener(CLOSE_EXAMPLE_POPOVER_EVENT, closeFromBackIntent);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      window.removeEventListener("resize", closeOnViewportChange);
+      window.removeEventListener("scroll", closeOnViewportChange, true);
+      window.removeEventListener(CLOSE_EXAMPLE_POPOVER_EVENT, closeFromBackIntent);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selected) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      markExamplePopoverClosed();
+      setSelected(null);
+    };
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => window.removeEventListener("keydown", closeOnEscape, true);
+  }, [selected]);
+
+  const selectWord = (event, token, partIndex) => {
+    if (selected?.partIndex === partIndex) {
+      setSelected(null);
+      return;
+    }
+    const rect = event.currentTarget.getBoundingClientRect();
+    const width = Math.min(310, window.innerWidth - 32);
+    const half = width / 2;
+    const left = Math.min(Math.max(rect.left + rect.width / 2, half + 16), window.innerWidth - half - 16);
+    const top = rect.bottom + 176 < window.innerHeight ? rect.bottom + 10 : Math.max(12, rect.top - 166);
+    const entry = wordIndex?.get(cleanRussianText(token).toLocaleLowerCase("ru-RU")) || null;
+    setSelected({ partIndex, token, entry, left, top, width });
+  };
+
+  const selectedEntry = selected?.entry;
+  const lemmaDiffers = selectedEntry && cleanRussianText(selected.token).toLocaleLowerCase("ru-RU") !== cleanRussianText(selectedEntry.word).toLocaleLowerCase("ru-RU");
+  return (
+    <span className={`interactive-example ${className}`.trim()} ref={rootRef}>
+      {parts.map((part, partIndex) => part.isRussian ? (
+        <button
+          type="button"
+          className={`example-token ${wordIndex?.has(cleanRussianText(part.text).toLocaleLowerCase("ru-RU")) ? "has-gloss" : ""}`}
+          key={`${part.text}-${partIndex}`}
+          onClick={(event) => selectWord(event, part.text, partIndex)}
+          aria-expanded={selected?.partIndex === partIndex}
+          aria-label={`${part.text}，单击查看释义`}
+        >{part.text}</button>
+      ) : <span key={`${part.text}-${partIndex}`}>{part.text}</span>)}
+      {selected && (
+        <span className="example-word-popover" role="dialog" aria-label={`${selected.token} 的释义`} style={{ left: selected.left, top: selected.top, width: selected.width }}>
+          <span className="example-popover-head"><strong>{selected.token}</strong><button type="button" onClick={() => setSelected(null)} aria-label="关闭释义">×</button></span>
+          {lemmaDiffers && <span className="example-lemma">原形：{selectedEntry.stressed || selectedEntry.word}</span>}
+          <span className="example-gloss">{selectedEntry?.meaning || (selectedEntry?.meaningEn ? `英译参考：${selectedEntry.meaningEn}` : "该词形暂未收录释义")}</span>
+          <span className="example-popover-meta">{[selectedEntry?.level, selectedEntry?.pos].filter(Boolean).join(" · ") || "本地词典"}</span>
+          <AudioButton text={selected.token} compact speed={speed} className="example-popover-audio" />
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -532,7 +753,7 @@ function TodayView({ learnedToday, goal, dueWords, record, settings, onStart, on
   );
 }
 
-function StudyDetailView({ word, mode, sessionType, index, total, selectedAnswer, correctAnswer, speed, grammar, onContinue, onBackToQuestion, onBack }) {
+function StudyDetailView({ word, mode, sessionType, index, total, selectedAnswer, correctAnswer, speed, grammar, exampleWordIndex, onContinue, onBack }) {
   const isCorrect = selectedAnswer === correctAnswer;
   const formItems = getFormItems(word);
   const grammarEntry = grammar?.[word.word];
@@ -543,52 +764,42 @@ function StudyDetailView({ word, mode, sessionType, index, total, selectedAnswer
       <div className="review-topline"><button className="back-button" onClick={onBack}>← 退出学习</button><span>{`第 ${index + 1} 题 / 共 ${total} 题`}</span><span>{`进度 ${Math.round(progress)}%`}</span></div>
       <div className="review-track"><span style={{ width: `${progress}%` }} /></div>
       <div className="study-detail-shell">
-        <div className={`study-result ${isCorrect ? "success" : "error"}`}><strong>{isCorrect ? "答对了" : "再看一遍这个词"}</strong><span>{isCorrect ? "记住释义、搭配和例句，再进入下一题" : `你的选择：${selectedAnswer} · 正确答案：${correctAnswer}`}</span></div>
-        <div className="detail-top study-detail-top"><div><span className="eyebrow">{sessionLabel} · {word.level} · {word.pos}</span><div className="detail-word-line"><h1>{word.stressed}</h1><AudioButton word={word} speed={speed} /></div><p className="phonetic">重音标记 · 点击按钮播放俄语神经 TTS 发音</p><div className="detail-meaning">{word.meaning}</div></div><span className="detail-index">单词详情</span></div>
-        {word.example ? <div className="detail-section"><h2>例句</h2><div className="example-russian example-audio-line"><span>{word.example}</span><AudioButton text={word.example} compact speed={speed} /></div><p className="example-chinese">{word.translation}</p></div> : null}
-        {word.collocations?.length ? <div className="detail-section"><h2>常见搭配</h2><div className="collocations">{word.collocations.map((item, itemIndex) => <div key={item}><div className="detail-russian-line"><strong>{item}</strong><AudioButton text={item} compact speed={speed} /></div><small>{COLLOCATION_MEANINGS[word.id]?.[itemIndex] || word.meaning}</small></div>)}</div></div> : null}
+        <div className={`study-result ${isCorrect ? "success" : "error"}`}><strong>{isCorrect ? "答对了" : "再看一遍这个词"}</strong>{!isCorrect && <span>{`你的选择：${selectedAnswer} · 正确答案：${correctAnswer}`}</span>}</div>
+        <div className="detail-top study-detail-top"><div><span className="eyebrow">{sessionLabel} · {word.level} · {word.pos}</span><div className="detail-word-line"><h1>{word.stressed}</h1><AudioButton word={word} speed={speed} /></div><div className="detail-meaning">{word.meaning}</div></div></div>
+        {word.example ? <div className="detail-section"><h2>例句</h2><div className="example-russian example-audio-line"><InteractiveExample text={word.example} wordIndex={exampleWordIndex} speed={speed} /><AudioButton text={word.example} compact speed={speed} /></div><p className="example-chinese">{word.translation}</p></div> : null}
+        {word.collocations?.length ? <div className="detail-section"><h2>常见搭配</h2><div className="collocations">{word.collocations.map((item, itemIndex) => <div key={item}><div className="detail-russian-line"><InteractiveExample text={item} wordIndex={exampleWordIndex} speed={speed} className="collocation-russian" /><AudioButton text={item} compact speed={speed} /></div><small>{COLLOCATION_MEANINGS[word.id]?.[itemIndex] || word.meaning}</small></div>)}</div></div> : null}
         {grammarEntry?.declension || grammarEntry?.conjugation ? <div className="detail-section"><h2>词形变化</h2><WordGrammarBlock word={word} grammar={grammar} speed={speed} /></div> : (formItems.length > 1 ? <div className="detail-section"><h2>词形变化</h2><div className="forms-list">{formItems.map(({ form, meaning }) => <div key={form}><div className="detail-russian-line"><strong>{form}</strong><AudioButton text={form} compact speed={speed} /></div><small>{meaning}</small></div>)}</div></div> : null)}
         <div className="detail-footer">
           <button className="primary-button" onClick={onContinue}>{isCorrect ? (index >= total - 1 ? (sessionType === "practice" ? "完成练习" : "完成今日学习") : "下一题") : "返回题目重新选择"} →</button>
-          {isCorrect && <button className="secondary-button" onClick={onBackToQuestion}>返回题目</button>}
         </div>
       </div>
     </div>
   );
 }
 
-function ReviewView({ queue, pool, settings, grammar, sessionType, initialIndex = 0, onAnswer, onDone, onBack }) {
+function ReviewView({ queue, pool, settings, grammar, exampleWordIndex, sessionType, initialIndex = 0, onAnswer, onDone, onBack }) {
   // 会话开始时的词表快照，避免词库懒加载完成后队列变化导致题目跳词
   const [sessionWords] = useState(queue);
   const [index, setIndex] = useState(() => Math.min(initialIndex, Math.max(sessionWords.length - 1, 0)));
   const [mode, setMode] = useState("meaning");
   const [selected, setSelected] = useState(null);
   const [showDetail, setShowDetail] = useState(false);
+  const answerLocked = useRef(false);
   const total = sessionWords.length;
   const activeWord = sessionWords[index];
   const correct = mode === "meaning" ? activeWord?.meaning : activeWord?.word;
 
   const options = useMemo(() => {
-    if (!activeWord) return [];
-    const correctValue = mode === "meaning" ? activeWord.meaning : activeWord.word;
-    // 干扰项从整个词池随机抽取，保证不同单词的错误选项各不相同
-    const distractors = [];
-    const seen = new Set([correctValue]);
-    for (const word of shuffled(pool)) {
-      if (word.id === activeWord.id) continue;
-      const value = mode === "meaning" ? word.meaning : word.word;
-      if (!value || seen.has(value)) continue;
-      seen.add(value);
-      distractors.push(value);
-      if (distractors.length === 3) break;
-    }
-    return shuffled([correctValue, ...distractors]);
+    return createOptions(activeWord, pool, mode);
   }, [activeWord, mode, pool]);
 
   const choose = (answer) => {
+    if (answerLocked.current || selected !== null || !activeWord) return;
+    answerLocked.current = true;
     const isCorrect = answer === correct;
     setSelected(answer);
     onAnswer?.(activeWord, sessionType, isCorrect, index + 1);
+    void (isCorrect ? haptics.success() : haptics.error());
     setShowDetail(true);
   };
   const next = () => {
@@ -596,12 +807,14 @@ function ReviewView({ queue, pool, settings, grammar, sessionType, initialIndex 
       onDone(total);
       return;
     }
+    answerLocked.current = false;
     setIndex((current) => current + 1);
     setSelected(null);
     setShowDetail(false);
   };
   const switchMode = (nextMode) => {
     if (nextMode === mode) return;
+    answerLocked.current = false;
     setMode(nextMode);
     setSelected(null);
     setShowDetail(false);
@@ -621,7 +834,7 @@ function ReviewView({ queue, pool, settings, grammar, sessionType, initialIndex 
   }
 
   if (showDetail) {
-    return <StudyDetailView word={activeWord} mode={mode} sessionType={sessionType} index={index} total={total} selectedAnswer={selected} correctAnswer={correct} speed={settings.speed} grammar={grammar} onContinue={selected === correct ? next : () => { setSelected(null); setShowDetail(false); }} onBackToQuestion={() => setShowDetail(false)} onBack={onBack} />;
+    return <StudyDetailView word={activeWord} mode={mode} sessionType={sessionType} index={index} total={total} selectedAnswer={selected} correctAnswer={correct} speed={settings.speed} grammar={grammar} exampleWordIndex={exampleWordIndex} onContinue={selected === correct ? next : () => { answerLocked.current = false; setSelected(null); setShowDetail(false); }} onBack={onBack} />;
   }
 
   const progress = (index / total) * 100;
@@ -657,10 +870,15 @@ function ReviewView({ queue, pool, settings, grammar, sessionType, initialIndex 
   );
 }
 
-function LibraryView({ dictionaryWords, loading, onSelectWord }) {
+const LIBRARY_PAGE_SIZE = 60;
+
+function LibraryView({ dictionaryWords, loading, settings, onSelectWord }) {
   const [query, setQuery] = useState("");
   const [level, setLevel] = useState("全部");
+  const [page, setPage] = useState(1);
+  const [pageInput, setPageInput] = useState("1");
   const searchInput = useRef(null);
+  const libraryList = useRef(null);
   useEffect(() => {
     const handleShortcut = (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
@@ -678,32 +896,54 @@ function LibraryView({ dictionaryWords, loading, onSelectWord }) {
       return (level === "全部" || word.level === level) && (!normalizedQuery || searchable.includes(normalizedQuery));
     });
   }, [level, query, dictionaryWords]);
-  const visibleWords = filtered.slice(0, 120);
+  const pagination = useMemo(() => paginateItems(filtered, page, LIBRARY_PAGE_SIZE), [filtered, page]);
+  const visibleWords = pagination.items;
+  const currentPage = pagination.page;
+  useEffect(() => {
+    if (page !== currentPage) setPage(currentPage);
+    setPageInput(String(currentPage));
+  }, [currentPage, page]);
+  const resetToFirstPage = () => {
+    setPage(1);
+    setPageInput("1");
+  };
+  const goToPage = (requestedPage) => {
+    const parsed = Number.parseInt(requestedPage, 10);
+    const nextPage = paginateItems(filtered, Number.isFinite(parsed) ? parsed : currentPage, LIBRARY_PAGE_SIZE).page;
+    setPage(nextPage);
+    setPageInput(String(nextPage));
+    if (nextPage !== currentPage) requestAnimationFrame(() => libraryList.current?.scrollIntoView({ block: "start" }));
+  };
   const levels = ["全部", "A1", "A2", "B1", "B2"];
   return (
     <div className="page-content library-page">
-      <header className="library-heading"><div><span className="eyebrow">词典</span><h1>查找俄语单词</h1><p className="library-intro">输入俄语、重音形式或中文释义，按等级筛选并打开完整词条。</p></div><span className="dictionary-source-note">本机词条 + OpenRussian 参考词库 · CC BY-SA</span></header>
-      <label className="search-box"><MagnifyingGlass size={22} /><input ref={searchInput} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索俄语单词或中文释义" /><kbd>Ctrl K</kbd></label>
-      <div className="library-meta"><span>{loading ? "词库加载中…" : `${filtered.length} 个词条${filtered.length > visibleWords.length ? ` · 显示前 ${visibleWords.length} 个` : ""}`}</span><div>{levels.map((item) => <button key={item} className={`filter-chip ${level === item ? "active" : ""}`} onClick={() => setLevel(item)}>{item}</button>)}</div></div>
-      <div className="library-list">
-        {visibleWords.map((word) => <div className="library-row" role="button" tabIndex={0} key={word.id} onClick={() => onSelectWord(word)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelectWord(word); } }}><span className="library-word">{word.stressed}<AudioButton word={word} compact /></span><span>{word.meaning || (word.meaningEn ? `英译参考：${word.meaningEn}` : "中文释义待补充")}</span><span className="level-tag">{word.level}</span><span className="library-arrow">→</span></div>)}
+      <header className="library-heading"><div><span className="eyebrow">词典</span><h1>查找俄语单词</h1></div><span className="dictionary-source-note">OpenRussian · WikDict · Wiktionary · CC BY-SA</span></header>
+      <label className="search-box"><MagnifyingGlass size={22} /><input ref={searchInput} value={query} onChange={(event) => { setQuery(event.target.value); resetToFirstPage(); }} placeholder="搜索俄语单词或中文释义" /><kbd>Ctrl K</kbd></label>
+      <div className="library-meta"><span>{loading ? "词库加载中…" : `${pagination.totalItems} 个词条 · 第 ${currentPage} / ${pagination.totalPages} 页`}</span><div>{levels.map((item) => <button key={item} className={`filter-chip ${level === item ? "active" : ""}`} onClick={() => { setLevel(item); resetToFirstPage(); }}>{item}</button>)}</div></div>
+      <div className="library-list" ref={libraryList}>
+        {visibleWords.map((word) => <div className="library-row" role="button" tabIndex={0} key={word.id} onClick={() => onSelectWord(word)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelectWord(word); } }}><span className="library-word">{word.stressed}<AudioButton word={word} compact speed={settings.speed} /></span><span>{word.meaning || (word.meaningEn ? `英译参考：${word.meaningEn}` : "中文释义待补充")}</span><span className="level-tag">{word.level}</span><span className="library-arrow">→</span></div>)}
         {!filtered.length && !loading && <div className="empty-state">没有找到匹配的单词。</div>}
       </div>
+      {pagination.totalItems > 0 && <nav className="library-pagination" aria-label="词库分页">
+        <button type="button" className="pagination-button" disabled={currentPage === 1} onClick={() => goToPage(currentPage - 1)}>← 上一页</button>
+        <label className="pagination-jump"><span>第</span><input type="number" min="1" max={pagination.totalPages} inputMode="numeric" value={pageInput} onChange={(event) => setPageInput(event.target.value)} onBlur={() => goToPage(pageInput)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); goToPage(pageInput); event.currentTarget.blur(); } }} aria-label="跳转页码" /><span>/ {pagination.totalPages} 页</span><small>{pagination.start + 1}–{pagination.end} / {pagination.totalItems}</small></label>
+        <button type="button" className="pagination-button" disabled={currentPage === pagination.totalPages} onClick={() => goToPage(currentPage + 1)}>下一页 →</button>
+      </nav>}
     </div>
   );
 }
 
-function WordDetail({ word, onBack, onPractice, onAddToday, added, learnedToday, grammar, settings }) {
+function WordDetail({ word, onBack, onPractice, onAddToday, added, learnedToday, grammar, exampleWordIndex, settings }) {
   const hasLearningData = Boolean(word.meaning);
   const grammarEntry = grammar?.[word.word];
   return (
     <div className="page-content detail-page">
       <button className="back-button detail-back" onClick={onBack}>← 返回词库</button>
-      <div className="detail-top"><div><span className="eyebrow">{word.level} · {word.pos}</span><div className="detail-word-line"><h1>{word.stressed}</h1><AudioButton word={word} speed={settings.speed} /></div><p className="phonetic">{word.source ? `${word.source} 参考词条 · ` : ""}点击按钮播放俄语神经 TTS 发音</p><div className="detail-meaning">{word.meaning || "中文释义待补充"}</div>{!word.meaning && word.meaningEn && <p className="reference-meaning">英译参考：{word.meaningEn}</p>}</div><span className="detail-index">词典词条</span></div>
-      <div className="detail-section"><h2>例句</h2>{word.example ? <><div className="example-russian example-audio-line"><span>{word.example}</span><AudioButton text={word.example} compact speed={settings.speed} /></div><p className="example-chinese">{word.translation}</p></> : <p className="empty-detail">该参考词条暂未收录例句。</p>}</div>
-      <div className="detail-section"><h2>常见搭配</h2>{word.collocations.length ? <div className="collocations">{word.collocations.map((item, index) => <div key={item}><div className="detail-russian-line"><strong>{item}</strong><AudioButton text={item} compact speed={settings.speed} /></div><small>{COLLOCATION_MEANINGS[word.id]?.[index] || word.meaning}</small></div>)}</div> : <p className="empty-detail">该参考词条暂未收录搭配。</p>}</div>
-      <div className="detail-section"><h2>词形变化</h2>{grammarEntry?.declension || grammarEntry?.conjugation ? <WordGrammarBlock word={word} grammar={grammar} speed={settings.speed} /> : (getFormItems(word).length > 1 ? <div className="forms-list">{getFormItems(word).map(({ form, meaning }) => <div key={form}><div className="detail-russian-line"><strong>{form}</strong><AudioButton text={form} compact speed={settings.speed} /></div><small>{meaning}</small></div>)}</div> : <p className="empty-detail">该参考词条暂未收录词形变化。</p>)}</div>
-      <div className="detail-footer">{hasLearningData ? <>{learnedToday ? <button className="primary-button add-button added" disabled><Check size={20} /> 今日已学习</button> : <button className={`primary-button add-button ${added ? "added" : ""}`} onClick={onAddToday}>{added ? <Check size={20} /> : <Plus size={20} />} {added ? "已加入今日学习" : "加入今日学习"}</button>}<button className="secondary-button" onClick={onPractice}>立即练习</button></> : <span className="detail-note">该词条来自参考词库，中文释义补全后即可加入学习计划。</span>}</div>
+      <div className="detail-top"><div><span className="eyebrow">{word.level} · {word.pos}</span><div className="detail-word-line"><h1>{word.stressed}</h1><AudioButton word={word} speed={settings.speed} /></div><div className="detail-meaning">{word.meaning || "中文释义待补充"}</div>{!word.meaning && word.meaningEn && <p className="reference-meaning">英译参考：{word.meaningEn}</p>}</div></div>
+      <div className="detail-section"><h2>例句</h2>{word.example ? <><div className="example-russian example-audio-line"><InteractiveExample text={word.example} wordIndex={exampleWordIndex} speed={settings.speed} /><AudioButton text={word.example} compact speed={settings.speed} /></div><p className="example-chinese">{word.translation}</p></> : <p className="empty-detail">暂无例句。</p>}</div>
+      <div className="detail-section"><h2>常见搭配</h2>{word.collocations.length ? <div className="collocations">{word.collocations.map((item, index) => <div key={item}><div className="detail-russian-line"><InteractiveExample text={item} wordIndex={exampleWordIndex} speed={settings.speed} className="collocation-russian" /><AudioButton text={item} compact speed={settings.speed} /></div><small>{COLLOCATION_MEANINGS[word.id]?.[index] || word.meaning}</small></div>)}</div> : <p className="empty-detail">暂无常见搭配。</p>}</div>
+      <div className="detail-section"><h2>词形变化</h2>{grammarEntry?.declension || grammarEntry?.conjugation ? <WordGrammarBlock word={word} grammar={grammar} speed={settings.speed} /> : (getFormItems(word).length > 1 ? <div className="forms-list">{getFormItems(word).map(({ form, meaning }) => <div key={form}><div className="detail-russian-line"><strong>{form}</strong><AudioButton text={form} compact speed={settings.speed} /></div><small>{meaning}</small></div>)}</div> : <p className="empty-detail">暂无词形变化。</p>)}</div>
+      <div className="detail-footer">{hasLearningData ? <>{learnedToday ? <button className="primary-button add-button added" disabled><Check size={20} /> 今日已学习</button> : <button className={`primary-button add-button ${added ? "added" : ""}`} onClick={onAddToday}>{added ? <Check size={20} /> : <Plus size={20} />} {added ? "已加入今日学习" : "加入今日学习"}</button>}<button className="secondary-button" onClick={onPractice}>立即练习</button></> : <span className="detail-note">补充中文释义后即可加入学习。</span>}</div>
     </div>
   );
 }
@@ -941,7 +1181,7 @@ function GrammarView({ grammar, loading, settings }) {
   return (
     <div className="page-content grammar-page">
       <header className="grammar-heading">
-        <div><span className="eyebrow">语法</span><h1>俄语语法</h1><p className="grammar-intro">名词的格、形容词变格与动词变位一览，附带发音。</p></div>
+        <div><span className="eyebrow">语法</span><h1>俄语语法</h1></div>
       </header>
       <div className="grammar-tabs" role="tablist">
         {GRAMMAR_TABS.map(({ id, label }) => <button key={id} role="tab" aria-selected={tab === id} className={`grammar-tab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>{label}</button>)}
@@ -1028,6 +1268,30 @@ function HistoryView({ stats, days }) {
   return <div className="page-content history-page"><span className="eyebrow">学习记录</span><h1>看见自己的进步</h1><p className="intro-copy">把每天的学习变成稳定的长期记忆。</p><div className="history-summary"><div><strong>{stats.learnedCount}</strong><span>已掌握词条</span></div><div><strong>{stats.streak}</strong><span>连续学习天数</span></div><div><strong>{stats.accuracy == null ? "—" : `${stats.accuracy}%`}</strong><span>累计正确率</span></div></div><div className="history-list">{days.length ? days.map(({ date, count }) => <div key={date}><span>{formatHistoryDay(date)}</span><strong>{count} 个词</strong><em>{date === todayKey() ? "进行中" : "完成"}</em></div>) : <div><span>暂无记录</span><strong>—</strong><em /></div>}</div></div>;
 }
 
+function ProfileView({ stats, settings, onNavigate }) {
+  return (
+    <div className="page-content profile-page">
+      <header className="profile-hero">
+        <span className="profile-avatar"><UserCircle size={48} weight="fill" /></span>
+        <div><span className="eyebrow">学习空间</span><h1>我的</h1></div>
+      </header>
+      <section className="profile-summary" aria-label="学习摘要">
+        <div><strong>{stats.learnedCount}</strong><span>已学词条</span></div>
+        <div><strong>{stats.streak}</strong><span>连续天数</span></div>
+        <div><strong>{stats.accuracy == null ? "—" : `${stats.accuracy}%`}</strong><span>正确率</span></div>
+      </section>
+      <section className="profile-menu" aria-label="账户菜单">
+        <button className="profile-menu-item" onClick={() => onNavigate("history")}>
+          <span className="profile-menu-icon"><ChartLineUp size={23} /></span><span><strong>学习记录</strong></span><CaretRight size={21} />
+        </button>
+        <button className="profile-menu-item" onClick={() => onNavigate("settings")}>
+          <span className="profile-menu-icon"><GearSix size={23} /></span><span><strong>学习设置</strong></span><CaretRight size={21} />
+        </button>
+      </section>
+    </div>
+  );
+}
+
 function SettingsView({ settings, onChange, backgroundImage, onChooseBackground, onClearBackground }) {
   const fileInput = useRef(null);
   const chooseFromFile = (event) => {
@@ -1041,18 +1305,24 @@ function SettingsView({ settings, onChange, backgroundImage, onChooseBackground,
   };
 
   const chooseImage = () => {
-    if (window.desktopApp?.selectBackgroundImage) void onChooseBackground();
+    if (isAndroid || window.desktopApp?.selectBackgroundImage) void onChooseBackground();
     else fileInput.current?.click();
   };
-  return <div className="page-content settings-page"><span className="eyebrow">设置</span><h1>学习偏好</h1><div className="settings-list"><label><span><strong>每日新词</strong><small>每天的学习目标，达到后仍可继续学习</small></span><select value={settings.dailyGoal} onChange={(event) => onChange({ ...settings, dailyGoal: Number(event.target.value) })}><option value="10">10</option><option value="20">20</option><option value="30">30</option></select></label><label><span><strong>发音速度</strong><small>听音辨词和单词详情中的播放速度</small></span><select value={settings.speed} onChange={(event) => onChange({ ...settings, speed: Number(event.target.value) })}><option value="0.7">慢速</option><option value="0.82">标准</option><option value="1">快速</option></select></label><label><span><strong>听音辨词</strong><small>开启后练习中可切换「听音选俄语」模式</small></span><button type="button" role="switch" aria-checked={settings.listenEnabled} className={`toggle ${settings.listenEnabled ? "on" : ""}`} onClick={() => onChange({ ...settings, listenEnabled: !settings.listenEnabled })}><span /></button></label><div className="background-setting"><div><strong>应用背景</strong><small>导入一张图片作为全局背景，图片只保存在本机。</small></div><div className="background-actions"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={chooseFromFile} /><button className="secondary-button" onClick={chooseImage}>{backgroundImage ? "更换图片" : "导入图片"}</button>{backgroundImage && <button className="text-button" onClick={onClearBackground}>恢复默认</button>}</div></div></div></div>;
+  return <div className="page-content settings-page"><span className="eyebrow">设置</span><h1>学习偏好</h1><div className="settings-list"><label><span><strong>每日新词</strong></span><select value={settings.dailyGoal} onChange={(event) => onChange({ ...settings, dailyGoal: Number(event.target.value) })}><option value="10">10</option><option value="20">20</option><option value="30">30</option></select></label><label><span><strong>发音速度</strong></span><select value={settings.speed} onChange={(event) => onChange({ ...settings, speed: Number(event.target.value), speedProfileVersion: 2 })}><option value="0.82">慢速</option><option value="1">标准</option><option value="1.15">快速</option></select></label><label><span><strong>听音辨词</strong></span><button type="button" role="switch" aria-checked={settings.listenEnabled} className={`toggle ${settings.listenEnabled ? "on" : ""}`} onClick={() => onChange({ ...settings, listenEnabled: !settings.listenEnabled })}><span /></button></label><div className="background-setting"><div><strong>应用背景</strong></div><div className="background-actions"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={chooseFromFile} /><button className="secondary-button" onClick={chooseImage}>{backgroundImage ? "更换图片" : "导入图片"}</button>{backgroundImage && <button className="text-button" onClick={onClearBackground}>恢复默认</button>}</div></div></div></div>;
 }
 
 export function App() {
+  const initialCoreState = useRef(null);
+  if (!initialCoreState.current) initialCoreState.current = loadCoreState(window.localStorage, todayKey());
   const [active, setActive] = useState("today");
-  const [progress, setProgress] = useState(getStoredStudyProgress);
-  const [settings, setSettings] = useState(getStoredSettings);
-  const [record, setRecord] = useState(getStoredRecord);
-  const [addedToday, setAddedToday] = useState(getStoredAddedToday);
+  const [sessions, setSessions] = useState(initialCoreState.current.sessions);
+  const [settings, setSettings] = useState(initialCoreState.current.settings);
+  const [record, setRecord] = useState(initialCoreState.current.record);
+  const [addedToday, setAddedToday] = useState(initialCoreState.current.addedToday);
+  const [storageReady, setStorageReady] = useState(!isAndroid);
+  const [storageError, setStorageError] = useState("");
+  const [storageAttempt, setStorageAttempt] = useState(0);
+  const [ttsNotice, setTtsNotice] = useState("");
   const [studySession, setStudySession] = useState("review");
   const [selectedWord, setSelectedWord] = useState(null);
   const [backgroundImage, setBackgroundImage] = useState("");
@@ -1061,36 +1331,64 @@ export function App() {
   const [grammar, setGrammar] = useState(null);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(STUDY_PROGRESS_KEY, JSON.stringify(progress));
-    } catch {
-      // Progress remains available for the current app session if storage is unavailable.
-    }
-  }, [progress]);
+    if (!isAndroid) return undefined;
+    let mounted = true;
+    let hydratedSuccessfully = false;
+    void (async () => {
+      try {
+        const keys = Object.values(CORE_STORAGE_KEYS);
+        await platformStorage.migrateFromLocalStorage(keys);
+        const entries = await Promise.all(keys.map(async (key) => [key, await platformStorage.get(key)]));
+        const values = new Map(entries);
+        const hydrated = loadCoreState({ getItem: (key) => values.get(key) ?? null }, todayKey());
+        if (!mounted) return;
+        setSessions(hydrated.sessions);
+        setSettings(hydrated.settings);
+        setRecord(hydrated.record);
+        setAddedToday(hydrated.addedToday);
+        hydratedSuccessfully = true;
+      } catch {
+        if (mounted) setStorageError("无法读取本机学习记录，请重试。原数据尚未被覆盖。");
+      } finally {
+        if (mounted && hydratedSuccessfully) setStorageReady(true);
+      }
+    })();
+    return () => { mounted = false; };
+  }, [storageAttempt]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(STUDY_SETTINGS_KEY, JSON.stringify(settings));
-    } catch {
-      // Settings remain available for the current app session if storage is unavailable.
-    }
-  }, [settings]);
+    let timeoutId;
+    const showNotice = () => {
+      window.clearTimeout(timeoutId);
+      setTtsNotice("未找到俄语语音。请在系统“文字转语音”设置中安装俄语语音数据。");
+      timeoutId = window.setTimeout(() => setTtsNotice(""), 6500);
+    };
+    window.addEventListener("russian-tts-unavailable", showNotice);
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.removeEventListener("russian-tts-unavailable", showNotice);
+    };
+  }, []);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(STUDY_RECORD_KEY, JSON.stringify(record));
-    } catch {
-      // Record remains available for the current app session if storage is unavailable.
-    }
-  }, [record]);
+    if (!storageReady) return;
+    void platformStorage.set(STUDY_PROGRESS_KEY, JSON.stringify({ version: SCHEMA_VERSION, sessions })).catch(() => {});
+  }, [sessions, storageReady]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(ADDED_TODAY_KEY, JSON.stringify(addedToday));
-    } catch {
-      // Added words remain available for the current app session if storage is unavailable.
-    }
-  }, [addedToday]);
+    if (!storageReady) return;
+    void platformStorage.set(STUDY_SETTINGS_KEY, JSON.stringify(normalizeSettings(settings))).catch(() => {});
+  }, [settings, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void platformStorage.set(STUDY_RECORD_KEY, JSON.stringify(normalizeRecord(record))).catch(() => {});
+  }, [record, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void platformStorage.set(ADDED_TODAY_KEY, JSON.stringify(normalizeAddedToday(addedToday, todayKey()))).catch(() => {});
+  }, [addedToday, storageReady]);
 
   // 词库参考数据懒加载：首屏只打包本地词，词库/例句/语法 JSON 按需加载
   useEffect(() => {
@@ -1113,26 +1411,104 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const loadBackground = window.desktopApp?.getBackgroundImage;
-    if (!loadBackground) return;
-    loadBackground().then((image) => {
+    platformBackground.get().then((image) => {
       if (image) setBackgroundImage(image);
     }).catch(() => {});
   }, []);
 
-  const pool = useMemo(() => buildStudyPool(lookupWords, examples), [lookupWords, examples]);
-  const dictionaryWords = useMemo(() => buildDictionaryWords(lookupWords, examples), [lookupWords, examples]);
-  const learnQueue = useMemo(() => buildLearnQueue(pool, record, addedToday), [pool, record, addedToday]);
-  const reviewQueue = useMemo(() => buildReviewQueue(pool, record), [pool, record]);
+  const pool = useMemo(() => buildCoreStudyPool(WORDS, lookupWords, examples), [lookupWords, examples]);
+  const dictionaryWords = useMemo(() => buildCoreDictionary(WORDS, lookupWords, examples), [lookupWords, examples]);
+  const exampleWordIndex = useMemo(() => buildExampleWordIndex(dictionaryWords, grammar), [dictionaryWords, grammar]);
+  const readingWordIndex = useMemo(() => buildReadingWordIndex(dictionaryWords, grammar), [dictionaryWords, grammar]);
+  const readingSpeechController = useMemo(() => createReadingSpeechController({
+    speak: (text) => speakRussian(text, settings.speed),
+    stop: stopRussianSpeech,
+  }), [settings.speed]);
+  const learnQueue = useMemo(() => buildCoreLearnQueue(pool, record, addedToday, todayKey()), [pool, record, addedToday]);
+  const reviewQueue = useMemo(() => buildCoreReviewQueue(pool, record, todayKey()), [pool, record]);
   const practiceQueue = selectedWord ? [selectedWord] : [];
-  const todayStats = useMemo(() => getTodayStats(pool, record), [pool, record]);
-  const historyStats = useMemo(() => getHistoryStats(pool, record), [pool, record]);
-  const historyDays = useMemo(() => getHistoryDays(pool, record), [pool, record]);
+  const todayStats = useMemo(() => getCoreTodayStats(pool, record, todayKey()), [pool, record]);
+  const historyStats = useMemo(() => getCoreHistoryStats(pool, record, todayKey()), [pool, record]);
+  const historyDays = useMemo(() => getCoreHistoryDays(pool, record), [pool, record]);
+
+  useEffect(() => () => {
+    void readingSpeechController.cancel();
+  }, [readingSpeechController]);
+
+  useEffect(() => {
+    void system.initialize();
+  }, []);
+
+  // Keep desktop Escape, browser history and Android's physical back button
+  // aligned with the currently visible screen.
+  useEffect(() => {
+    let disposed = false;
+    let removeNativeListener = () => {};
+    const closeExamplePopover = () => {
+      if (!document.querySelector(".example-word-popover")) return false;
+      markExamplePopoverClosed();
+      window.dispatchEvent(new Event(CLOSE_EXAMPLE_POPOVER_EVENT));
+      return true;
+    };
+    const closeReadingPopover = () => {
+      if (!document.querySelector(".reading-popover")) return false;
+      window.dispatchEvent(new Event("reading:close-popover"));
+      return true;
+    };
+    const goBack = () => {
+      if (active === "learn" || active === "review") {
+        if (studySession === "practice") setActive("library");
+        else {
+          setSelectedWord(null);
+          setActive("today");
+        }
+      } else if (selectedWord) {
+        setSelectedWord(null);
+      } else if (["history", "settings"].includes(active)) {
+        setActive("profile");
+      } else if (active !== "today") {
+        setActive("today");
+      } else {
+        return false;
+      }
+      return true;
+    };
+    const handleBackIntent = (event) => {
+      if (event.type === "keydown" && event.key !== "Escape") return;
+      if (closeReadingPopover() || closeExamplePopover()) {
+        event.preventDefault?.();
+        event.stopImmediatePropagation?.();
+        return;
+      }
+      if (event.type === "keydown" && wasExamplePopoverJustClosed()) {
+        event.preventDefault?.();
+        event.stopImmediatePropagation?.();
+        return;
+      }
+      if (goBack()) event.preventDefault?.();
+    };
+    void system.onBackButton(() => {
+      if (closeReadingPopover() || closeExamplePopover()) return;
+      if (wasExamplePopoverJustClosed()) return;
+      if (!goBack()) system.exitApp();
+    }).then((remove) => {
+      if (disposed) remove();
+      else removeNativeListener = remove;
+    }).catch(() => {});
+    window.addEventListener("keydown", handleBackIntent);
+    window.addEventListener("popstate", handleBackIntent);
+    return () => {
+      disposed = true;
+      removeNativeListener();
+      window.removeEventListener("keydown", handleBackIntent);
+      window.removeEventListener("popstate", handleBackIntent);
+    };
+  }, [active, selectedWord, studySession]);
 
   const chooseBackground = async (fallbackDataUrl) => {
-    if (window.desktopApp?.selectBackgroundImage) {
+    if (isAndroid || window.desktopApp?.selectBackgroundImage) {
       try {
-        const image = await window.desktopApp.selectBackgroundImage();
+        const image = await platformBackground.select();
         if (image) setBackgroundImage(image);
         return;
       } catch {
@@ -1143,9 +1519,9 @@ export function App() {
   };
   const clearBackground = async () => {
     try {
-      await window.desktopApp?.clearBackgroundImage?.();
+      await platformBackground.clear();
     } catch {
-      // The local UI state is still cleared if the desktop file is unavailable.
+      // The local UI state is still cleared if the platform file is unavailable.
     }
     setBackgroundImage("");
   };
@@ -1158,30 +1534,19 @@ export function App() {
     setStudySession(type);
     setActive(type === "practice" ? "review" : type);
   };
-  const handleAnswer = (word, type, isCorrect, answeredCount) => {
-    setRecord((current) => {
-      const previous = current.words[word.id];
-      const entry = {
-        ...previous,
-        attempts: (previous?.attempts || 0) + 1,
-        correct: (previous?.correct || 0) + (isCorrect ? 1 : 0),
-        lastSeen: todayKey(),
-      };
-      if (type === "learn" && !previous?.learnedAt) entry.learnedAt = todayKey();
-      if (type === "review") {
-        // 间隔重复：答对升档（1/3/7/14/30/90 天），答错回到最低档明天再复习
-        entry.reviewStage = isCorrect ? (previous?.reviewStage || 0) + 1 : 0;
-      } else if (type === "learn") {
-        entry.reviewStage = 0;
-      }
-      return { ...current, words: { ...current.words, [word.id]: entry } };
-    });
+  const handleAnswer = (word, type, isCorrect) => {
+    const today = todayKey();
+    setRecord((current) => recordAnswer(current, { wordId: word.id, sessionType: type, correct: isCorrect, today }));
     if (type !== "practice" && isCorrect) {
-      setProgress((current) => ({ ...current, [type]: Math.max(current[type] || 0, answeredCount) }));
+      const sourceQueue = type === "learn" ? learnQueue : reviewQueue;
+      setSessions((current) => {
+        const session = normalizeSession(current[type], type, sourceQueue, today);
+        return { ...current, [type]: completeSessionWord(session, word.id) };
+      });
     }
   };
   const addWordToToday = (wordId) => {
-    setAddedToday((current) => (current.includes(wordId) ? current : [...current, wordId]));
+    setAddedToday((current) => addWordForToday(current, wordId, todayKey()));
   };
   const exitStudy = () => {
     if (studySession === "practice") {
@@ -1191,32 +1556,60 @@ export function App() {
     setSelectedWord(null);
     setActive("today");
   };
+  const finishStudy = (type) => {
+    if (type !== "practice") {
+      setSessions((current) => {
+        const next = { ...current };
+        delete next[type];
+        return next;
+      });
+    }
+    exitStudy();
+  };
   const navigate = (id) => {
     setSelectedWord(null);
     if (id === "review") setStudySession("review");
     setActive(id);
   };
+  const resolveReadingEntry = (token) => resolveReadingWord(token, readingWordIndex)?.entry || null;
+  const speakReadingText = (text) => {
+    if (isAndroid) return speakRussian(text, settings.speed);
+    return readingSpeechController.readAll(text, { speed: settings.speed, maxChars: 220 });
+  };
+  const stopReading = () => isAndroid ? stopRussianSpeech() : readingSpeechController.cancel();
 
   let content = null;
   if (active === "learn" || active === "review") {
     const type = active === "learn" ? "learn" : studySession;
-    const queue = type === "learn" ? learnQueue : type === "practice" ? practiceQueue : reviewQueue;
-    content = <ReviewView key={type} queue={queue} pool={pool} settings={settings} grammar={grammar} sessionType={type} initialIndex={type === "practice" ? 0 : progress[type] || 0} onAnswer={handleAnswer} onDone={exitStudy} onBack={exitStudy} />;
+    const baseQueue = type === "learn" ? learnQueue : type === "practice" ? practiceQueue : reviewQueue;
+    const session = type === "practice" ? null : normalizeSession(sessions[type], type, baseQueue, todayKey());
+    const sessionComplete = Boolean(session && session.cursor >= session.queueIds.length);
+    const queue = sessionComplete ? [] : session ? hydrateSessionQueue(session, pool) : baseQueue;
+    const initialIndex = session ? Math.min(session.cursor, Math.max(queue.length - 1, 0)) : 0;
+    content = <ReviewView key={type} queue={queue} pool={pool} settings={settings} grammar={grammar} exampleWordIndex={exampleWordIndex} sessionType={type} initialIndex={initialIndex} onAnswer={handleAnswer} onDone={() => finishStudy(type)} onBack={sessionComplete ? () => finishStudy(type) : exitStudy} />;
   } else if (selectedWord && active === "library") {
-    content = <WordDetail word={selectedWord} onBack={() => setSelectedWord(null)} onPractice={() => startStudy("practice")} onAddToday={() => addWordToToday(selectedWord.id)} added={addedToday.includes(selectedWord.id)} learnedToday={record.words[selectedWord.id]?.learnedAt === todayKey()} grammar={grammar} settings={settings} />;
+    content = <WordDetail word={selectedWord} onBack={() => setSelectedWord(null)} onPractice={() => startStudy("practice")} onAddToday={() => addWordToToday(selectedWord.id)} added={addedToday.wordIds.includes(selectedWord.id)} learnedToday={record.words[selectedWord.id]?.learnedAt === todayKey()} grammar={grammar} exampleWordIndex={exampleWordIndex} settings={settings} />;
   } else if (active === "grammar") {
     content = <GrammarView grammar={grammar} loading={!grammar} settings={settings} />;
+  } else if (active === "reading") {
+    content = <ReadingView texts={readingTexts} resolveWord={resolveReadingEntry} onSpeak={speakReadingText} onStop={stopReading} />;
   } else if (active === "library") {
-    content = <LibraryView dictionaryWords={dictionaryWords} loading={!lookupWords} onSelectWord={goToWord} />;
+    content = <LibraryView dictionaryWords={dictionaryWords} loading={!lookupWords} settings={settings} onSelectWord={goToWord} />;
   } else if (active === "history") {
     content = <HistoryView stats={historyStats} days={historyDays} />;
   } else if (active === "settings") {
     content = <SettingsView settings={settings} onChange={setSettings} backgroundImage={backgroundImage} onChooseBackground={chooseBackground} onClearBackground={clearBackground} />;
+  } else if (active === "profile") {
+    content = <ProfileView stats={historyStats} settings={settings} onNavigate={navigate} />;
   } else {
     content = <TodayView learnedToday={todayStats.learnedToday} goal={settings.dailyGoal} dueWords={todayStats.dueWords} record={record} settings={settings} onStart={() => startStudy("learn")} onStartReview={() => startStudy("review")} onSelectWord={goToWord} />;
   }
 
   const shellStyle = backgroundImage ? { "--custom-background": `url(${backgroundImage})` } : undefined;
-  const navActive = active === "learn" ? "today" : active === "review" && studySession === "practice" ? "library" : active;
-  return <div className={`app-shell ${backgroundImage ? "custom-background" : ""}`} style={shellStyle}><Nav active={navActive} onChange={navigate} goal={settings.dailyGoal} /><main className="main-panel">{content}</main></div>;
+  const navActive = active === "learn" ? "today" : active === "review" && studySession === "practice" ? "library" : ["history", "settings"].includes(active) ? "profile" : active;
+  const sessionActive = active === "learn" || active === "review";
+  if (isAndroid && !storageReady) {
+    return <main className="storage-gate"><div><span className="brand-mark">RU</span><h1>{storageError ? "学习记录读取失败" : "正在载入学习记录"}</h1><p>{storageError || "正在安全读取这台设备上的设置与学习进度…"}</p>{storageError && <button className="primary-button" onClick={() => { setStorageError(""); setStorageAttempt((value) => value + 1); }}>重新读取</button>}</div></main>;
+  }
+  return <div className={`app-shell ${sessionActive ? "in-session" : ""} ${backgroundImage ? "custom-background" : ""}`} style={shellStyle}><Nav active={navActive} onChange={navigate} goal={settings.dailyGoal} /><main className="main-panel">{content}</main>{ttsNotice && <div className="app-toast" role="status">{ttsNotice}</div>}</div>;
 }
