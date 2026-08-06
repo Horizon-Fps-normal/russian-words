@@ -133,6 +133,8 @@ h2 { font-size: 20px; letter-spacing: -.02em; }
 .dictionary-source-note { color: #7e8792; font-size: 13px; }
 .import-button, .secondary-button { display: inline-flex; align-items: center; gap: 9px; min-height: 45px; padding: 0 18px; color: var(--blue); border: 1px solid #bac9df; background: transparent; font-size: 14px; }
 .import-button:hover, .secondary-button:hover { background: var(--blue-soft); }
+.danger-button { display: inline-flex; align-items: center; gap: 9px; min-height: 45px; padding: 0 18px; color: #c0392b; border: 1px solid #e3b7b2; background: transparent; font-size: 14px; }
+.danger-button:hover { background: #fdf0ee; }
 .search-box { display: flex; align-items: center; gap: 14px; height: 60px; border: 1px solid #cfd5db; background: white; padding: 0 18px; color: #88929e; }
 .search-box input { flex: 1; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 16px; }
 .search-box kbd { padding: 4px 8px; border: 1px solid #d5d9dd; color: #8b949d; background: #f7f8f9; font-size: 12px; }

@@ -254,8 +254,11 @@ function getStoredSettings() {
 
 function getStoredStudyProgress() {
   const stored = getStoredJson(STUDY_PROGRESS_KEY, {});
+  const today = todayKey();
+  const learnedToday = Object.values(getStoredRecord().words).filter((entry) => entry?.learnedAt === today).length;
   return {
-    learn: Math.max(0, Number(stored.learn) || 0),
+    // 学习断点不能超过“今天实际学过 + 今天加入队列”的词数，防止旧进度/清空记录后会话跳词
+    learn: Math.min(Math.max(0, Number(stored.learn) || 0), learnedToday + getStoredAddedToday().length),
     review: Math.max(0, Number(stored.review) || 0),
   };
 }
@@ -323,12 +326,90 @@ function buildDictionaryWords(lookupWords, examples) {
   return merged;
 }
 
-// 今日学习队列：加入今日学习的词在前，然后是未学过的词（不限每日额度）
+// 词性分组键：把“名词 · 阳性”“动词 · 不完成体”归入「名词」「动词」大类
+function posGroup(pos) {
+  return String(pos || "其他").split(" · ")[0] || "其他";
+}
+
+// 释义按中文标点切分，用于判断两个词的释义是否有重叠
+function meaningSegments(meaning) {
+  return new Set(String(meaning || "").split(/[；;，,、\s]+/).filter(Boolean));
+}
+
+function meaningsOverlap(a, b) {
+  const setA = meaningSegments(a);
+  for (const segment of meaningSegments(b)) {
+    if (setA.has(segment)) return true;
+  }
+  return false;
+}
+
+// 以当天日期为种子的伪随机数生成器：同一天内学习队列顺序稳定，断点续学不会因为重排而跳词
+function daySeededRandom() {
+  let seed = 2166136261;
+  for (const char of todayKey()) {
+    seed ^= char.charCodeAt(0);
+    seed = Math.imul(seed, 16777619);
+  }
+  return () => {
+    seed += 0x6D2B79F5;
+    let t = seed;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// 今日学习队列：加入今日学习的词在前；其余未学词按等级升序，同一等级内按词性轮转取词，
+// 每个词性桶内洗牌，并避免连续出现释义重叠的词——防止连排出现词性/意思相近的词（如虚词墙）
 function buildLearnQueue(pool, record, addedToday) {
   const addedIds = new Set(addedToday);
   const added = addedToday.map((id) => pool.find((word) => word.id === id)).filter(Boolean);
-  const unlearned = pool.filter((word) => !record.words[word.id]?.learnedAt);
-  return [...added, ...unlearned.filter((word) => !addedIds.has(word.id))];
+  const unlearned = pool.filter((word) => !record.words[word.id]?.learnedAt && !addedIds.has(word.id));
+  const rng = daySeededRandom();
+  const levels = new Map();
+  for (const word of unlearned) {
+    const level = word.level || "其他";
+    if (!levels.has(level)) levels.set(level, new Map());
+    const posMap = levels.get(level);
+    const group = posGroup(word.pos);
+    if (!posMap.has(group)) posMap.set(group, []);
+    posMap.get(group).push(word);
+  }
+  for (const [, posMap] of levels) {
+    for (const bucket of posMap.values()) {
+      for (let i = bucket.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(rng() * (i + 1));
+        [bucket[i], bucket[j]] = [bucket[j], bucket[i]];
+      }
+    }
+  }
+  const queue = [];
+  let lastMeaning = null;
+  for (const [, posMap] of levels) {
+    const groups = [...posMap.keys()];
+    const cursors = new Map(groups.map((group) => [group, 0]));
+    let remaining = [...posMap.values()].reduce((sum, bucket) => sum + bucket.length, 0);
+    while (remaining > 0) {
+      for (const group of groups) {
+        const bucket = posMap.get(group);
+        if (cursors.get(group) >= bucket.length) continue;
+        // 优先挑一个与上一个词释义不重叠的词，没有则取桶内下一个
+        let pickIndex = cursors.get(group);
+        if (lastMeaning) {
+          const overlapFree = bucket.slice(cursors.get(group)).findIndex((word) => !meaningsOverlap(word.meaning, lastMeaning));
+          if (overlapFree >= 0) pickIndex = cursors.get(group) + overlapFree;
+        }
+        const picked = bucket[pickIndex];
+        [bucket[cursors.get(group)], bucket[pickIndex]] = [bucket[pickIndex], bucket[cursors.get(group)]];
+        cursors.set(group, cursors.get(group) + 1);
+        remaining -= 1;
+        lastMeaning = picked.meaning;
+        queue.push(picked);
+      }
+    }
+  }
+  return [...added, ...queue];
 }
 
 // 复习队列：间隔重复——到期的词优先（按到期日排序）；没有到期词时回退到全部已学词（最久未复习的在前）
@@ -1292,7 +1373,7 @@ function ProfileView({ stats, settings, onNavigate }) {
   );
 }
 
-function SettingsView({ settings, onChange, backgroundImage, onChooseBackground, onClearBackground }) {
+function SettingsView({ settings, onChange, backgroundImage, onChooseBackground, onClearBackground, onResetData }) {
   const fileInput = useRef(null);
   const chooseFromFile = (event) => {
     const file = event.target.files?.[0];
@@ -1308,7 +1389,7 @@ function SettingsView({ settings, onChange, backgroundImage, onChooseBackground,
     if (isAndroid || window.desktopApp?.selectBackgroundImage) void onChooseBackground();
     else fileInput.current?.click();
   };
-  return <div className="page-content settings-page"><span className="eyebrow">设置</span><h1>学习偏好</h1><div className="settings-list"><label><span><strong>每日新词</strong></span><select value={settings.dailyGoal} onChange={(event) => onChange({ ...settings, dailyGoal: Number(event.target.value) })}><option value="10">10</option><option value="20">20</option><option value="30">30</option></select></label><label><span><strong>发音速度</strong></span><select value={settings.speed} onChange={(event) => onChange({ ...settings, speed: Number(event.target.value), speedProfileVersion: 2 })}><option value="0.82">慢速</option><option value="1">标准</option><option value="1.15">快速</option></select></label><label><span><strong>听音辨词</strong></span><button type="button" role="switch" aria-checked={settings.listenEnabled} className={`toggle ${settings.listenEnabled ? "on" : ""}`} onClick={() => onChange({ ...settings, listenEnabled: !settings.listenEnabled })}><span /></button></label><div className="background-setting"><div><strong>应用背景</strong></div><div className="background-actions"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={chooseFromFile} /><button className="secondary-button" onClick={chooseImage}>{backgroundImage ? "更换图片" : "导入图片"}</button>{backgroundImage && <button className="text-button" onClick={onClearBackground}>恢复默认</button>}</div></div></div></div>;
+  return <div className="page-content settings-page"><span className="eyebrow">设置</span><h1>学习偏好</h1><div className="settings-list"><label><span><strong>每日新词</strong></span><select value={settings.dailyGoal} onChange={(event) => onChange({ ...settings, dailyGoal: Number(event.target.value) })}><option value="10">10</option><option value="20">20</option><option value="30">30</option></select></label><label><span><strong>发音速度</strong></span><select value={settings.speed} onChange={(event) => onChange({ ...settings, speed: Number(event.target.value), speedProfileVersion: 2 })}><option value="0.82">慢速</option><option value="1">标准</option><option value="1.15">快速</option></select></label><label><span><strong>听音辨词</strong></span><button type="button" role="switch" aria-checked={settings.listenEnabled} className={`toggle ${settings.listenEnabled ? "on" : ""}`} onClick={() => onChange({ ...settings, listenEnabled: !settings.listenEnabled })}><span /></button></label><div className="background-setting"><div><strong>应用背景</strong></div><div className="background-actions"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={chooseFromFile} /><button className="secondary-button" onClick={chooseImage}>{backgroundImage ? "更换图片" : "导入图片"}</button>{backgroundImage && <button className="text-button" onClick={onClearBackground}>恢复默认</button>}</div></div><div className="background-setting"><div><strong>学习数据</strong></div><div className="background-actions"><button className="danger-button" onClick={onResetData}>清空学习数据</button></div></div></div></div>;
 }
 
 export function App() {
@@ -1525,6 +1606,21 @@ export function App() {
     }
     setBackgroundImage("");
   };
+  const resetStudyData = async () => {
+    if (!window.confirm("确定要清空所有学习数据吗？已学单词、复习进度和今日加入的词都会被清除，此操作不可撤销。")) return;
+    try {
+      await Promise.all([
+        STUDY_PROGRESS_KEY,
+        STUDY_RECORD_KEY,
+        ADDED_TODAY_KEY,
+      ].map((key) => platformStorage.remove(key)));
+    } catch {
+      // State is still reset for the current app session if storage is unavailable.
+    }
+    setSessions({});
+    setRecord({ version: SCHEMA_VERSION, words: {} });
+    setAddedToday(normalizeAddedToday(null, todayKey()));
+  };
 
   const goToWord = (word) => {
     setSelectedWord(word);
@@ -1598,7 +1694,7 @@ export function App() {
   } else if (active === "history") {
     content = <HistoryView stats={historyStats} days={historyDays} />;
   } else if (active === "settings") {
-    content = <SettingsView settings={settings} onChange={setSettings} backgroundImage={backgroundImage} onChooseBackground={chooseBackground} onClearBackground={clearBackground} />;
+    content = <SettingsView settings={settings} onChange={setSettings} backgroundImage={backgroundImage} onChooseBackground={chooseBackground} onClearBackground={clearBackground} onResetData={resetStudyData} />;
   } else if (active === "profile") {
     content = <ProfileView stats={historyStats} settings={settings} onNavigate={navigate} />;
   } else {

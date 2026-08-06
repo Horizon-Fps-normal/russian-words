@@ -103,6 +103,19 @@ test("today-added words expire by date, lead queue and daily goal never caps que
   assert.equal(buildLearnQueue(Array.from({ length: 31 }, (_, id) => ({ id: String(id) })), { words: {} }, null, "2026-08-06").length, 31);
 });
 
+test("learn queue is stable within a day and interleaves parts of speech", () => {
+  const mixed = [
+    { id: "n1", word: "дом", meaning: "家", level: "A1", pos: "名词 · 阳性" },
+    { id: "n2", word: "стол", meaning: "桌子", level: "A1", pos: "名词 · 阳性" },
+    { id: "v1", word: "читать", meaning: "阅读", level: "A1", pos: "动词 · 未完成体" },
+    { id: "v2", word: "писать", meaning: "写", level: "A1", pos: "动词 · 未完成体" },
+  ];
+  const first = buildLearnQueue(mixed, { words: {} }, null, "2026-08-06");
+  const second = buildLearnQueue(mixed, { words: {} }, null, "2026-08-06");
+  assert.deepEqual(first.map((word) => word.id), second.map((word) => word.id));
+  assert.deepEqual(first.map((word) => word.pos.split(" · ")[0]), ["名词", "动词", "名词", "动词"]);
+});
+
 test("SRS uses 1/3/7/14/30/90 days and caps later stages", () => {
   const expected = ["2026-08-02", "2026-08-04", "2026-08-08", "2026-08-15", "2026-08-31", "2026-10-30", "2026-10-30"];
   expected.forEach((due, stage) => assert.equal(reviewDueDate({ learnedAt: "2026-08-01", lastSeen: "2026-08-01", reviewStage: stage }), due));
@@ -171,6 +184,19 @@ test("answer options support both modes and remain unique", () => {
   assert.ok(meanings.includes("灯塔"));
   assert.ok(listening.includes("маяк"));
   assert.equal(new Set(meanings).size, meanings.length);
+});
+
+test("meaning options avoid overlapping glosses when enough alternatives exist", () => {
+  const pool = [
+    { id: "correct", word: "и", meaning: "和；与" },
+    { id: "overlap", word: "да", meaning: "和" },
+    { id: "safe-1", word: "дом", meaning: "房子" },
+    { id: "safe-2", word: "читать", meaning: "阅读" },
+    { id: "safe-3", word: "быстро", meaning: "快速地" },
+  ];
+  const options = createOptions(pool[0], pool, "meaning", () => 0.5);
+  assert.ok(options.includes("和；与"));
+  assert.ok(!options.includes("和"));
 });
 
 test("history counts study/review/practice activity in streak and all attempts in accuracy", () => {
