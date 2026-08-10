@@ -33,7 +33,27 @@ function mergeWords(localWords, lookupWords, examples, studyOnly) {
   });
 }
 
-export function buildStudyPool(localWords, lookupWords, examples) {
+export function buildStudyPool(localWords, lookupWords, examples, rankedStudyWords) {
+  if (Array.isArray(rankedStudyWords) && rankedStudyWords.length) {
+    const localByWord = new Map((localWords || []).map((word) => [normalizeRussian(word.word), word]));
+    const lookupByWord = new Map((lookupWords || []).map((word) => [normalizeRussian(word.word), word]));
+    const indexedExamples = exampleIndex(examples);
+    return rankedStudyWords.map((ranked) => {
+      const local = localByWord.get(normalizeRussian(ranked.word));
+      const lookup = lookupByWord.get(normalizeRussian(ranked.lookupWord || ranked.word));
+      const word = { ...(lookup || {}), ...ranked, ...(local || {}) };
+      const distinctSense = String(ranked.id || "").startsWith("core5000-");
+      word.id = distinctSense ? ranked.id : (local?.id || ranked.id);
+      word.studyRank = ranked.studyRank;
+      word.meaning = distinctSense ? ranked.meaning : (local?.meaning || ranked.meaning);
+      const example = indexedExamples.get(normalizeRussian(word.word));
+      if (example) {
+        word.example = example.ru || word.example;
+        word.translation = example.zh || word.translation;
+      }
+      return word;
+    }).sort((a, b) => a.studyRank - b.studyRank);
+  }
   return mergeWords(localWords, lookupWords, examples, true).sort((a, b) =>
     (LEVEL_ORDER[a.level] ?? 99) - (LEVEL_ORDER[b.level] ?? 99));
 }

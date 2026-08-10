@@ -22,7 +22,6 @@ import {
   STORAGE_KEYS as CORE_STORAGE_KEYS,
   addWordForToday,
   buildDictionary as buildCoreDictionary,
-  buildExampleWordIndex,
   buildReadingWordIndex,
   buildLearnQueue as buildCoreLearnQueue,
   buildReviewQueue as buildCoreReviewQueue,
@@ -49,12 +48,14 @@ import ReadingView from "./components/ReadingView.jsx";
 import readingTexts from "./data/reading-texts.js";
 import {
   background as platformBackground,
-  haptics,
   isAndroid,
   speech as platformSpeech,
   storage as platformStorage,
   system,
 } from "./platform/index.js";
+
+const isAndroidBuild = import.meta.env.VITE_APP_TARGET === "android";
+const useMobileCoreDataset = isAndroid || isAndroidBuild;
 
 const WORDS = [
   {
@@ -254,11 +255,8 @@ function getStoredSettings() {
 
 function getStoredStudyProgress() {
   const stored = getStoredJson(STUDY_PROGRESS_KEY, {});
-  const today = todayKey();
-  const learnedToday = Object.values(getStoredRecord().words).filter((entry) => entry?.learnedAt === today).length;
   return {
-    // 学习断点不能超过“今天实际学过 + 今天加入队列”的词数，防止旧进度/清空记录后会话跳词
-    learn: Math.min(Math.max(0, Number(stored.learn) || 0), learnedToday + getStoredAddedToday().length),
+    learn: Math.max(0, Number(stored.learn) || 0),
     review: Math.max(0, Number(stored.review) || 0),
   };
 }
@@ -326,90 +324,12 @@ function buildDictionaryWords(lookupWords, examples) {
   return merged;
 }
 
-// 词性分组键：把“名词 · 阳性”“动词 · 不完成体”归入「名词」「动词」大类
-function posGroup(pos) {
-  return String(pos || "其他").split(" · ")[0] || "其他";
-}
-
-// 释义按中文标点切分，用于判断两个词的释义是否有重叠
-function meaningSegments(meaning) {
-  return new Set(String(meaning || "").split(/[；;，,、\s]+/).filter(Boolean));
-}
-
-function meaningsOverlap(a, b) {
-  const setA = meaningSegments(a);
-  for (const segment of meaningSegments(b)) {
-    if (setA.has(segment)) return true;
-  }
-  return false;
-}
-
-// 以当天日期为种子的伪随机数生成器：同一天内学习队列顺序稳定，断点续学不会因为重排而跳词
-function daySeededRandom() {
-  let seed = 2166136261;
-  for (const char of todayKey()) {
-    seed ^= char.charCodeAt(0);
-    seed = Math.imul(seed, 16777619);
-  }
-  return () => {
-    seed += 0x6D2B79F5;
-    let t = seed;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-// 今日学习队列：加入今日学习的词在前；其余未学词按等级升序，同一等级内按词性轮转取词，
-// 每个词性桶内洗牌，并避免连续出现释义重叠的词——防止连排出现词性/意思相近的词（如虚词墙）
+// 今日学习队列：加入今日学习的词在前，然后是未学过的词（不限每日额度）
 function buildLearnQueue(pool, record, addedToday) {
   const addedIds = new Set(addedToday);
   const added = addedToday.map((id) => pool.find((word) => word.id === id)).filter(Boolean);
-  const unlearned = pool.filter((word) => !record.words[word.id]?.learnedAt && !addedIds.has(word.id));
-  const rng = daySeededRandom();
-  const levels = new Map();
-  for (const word of unlearned) {
-    const level = word.level || "其他";
-    if (!levels.has(level)) levels.set(level, new Map());
-    const posMap = levels.get(level);
-    const group = posGroup(word.pos);
-    if (!posMap.has(group)) posMap.set(group, []);
-    posMap.get(group).push(word);
-  }
-  for (const [, posMap] of levels) {
-    for (const bucket of posMap.values()) {
-      for (let i = bucket.length - 1; i > 0; i -= 1) {
-        const j = Math.floor(rng() * (i + 1));
-        [bucket[i], bucket[j]] = [bucket[j], bucket[i]];
-      }
-    }
-  }
-  const queue = [];
-  let lastMeaning = null;
-  for (const [, posMap] of levels) {
-    const groups = [...posMap.keys()];
-    const cursors = new Map(groups.map((group) => [group, 0]));
-    let remaining = [...posMap.values()].reduce((sum, bucket) => sum + bucket.length, 0);
-    while (remaining > 0) {
-      for (const group of groups) {
-        const bucket = posMap.get(group);
-        if (cursors.get(group) >= bucket.length) continue;
-        // 优先挑一个与上一个词释义不重叠的词，没有则取桶内下一个
-        let pickIndex = cursors.get(group);
-        if (lastMeaning) {
-          const overlapFree = bucket.slice(cursors.get(group)).findIndex((word) => !meaningsOverlap(word.meaning, lastMeaning));
-          if (overlapFree >= 0) pickIndex = cursors.get(group) + overlapFree;
-        }
-        const picked = bucket[pickIndex];
-        [bucket[cursors.get(group)], bucket[pickIndex]] = [bucket[pickIndex], bucket[cursors.get(group)]];
-        cursors.set(group, cursors.get(group) + 1);
-        remaining -= 1;
-        lastMeaning = picked.meaning;
-        queue.push(picked);
-      }
-    }
-  }
-  return [...added, ...queue];
+  const unlearned = pool.filter((word) => !record.words[word.id]?.learnedAt);
+  return [...added, ...unlearned.filter((word) => !addedIds.has(word.id))];
 }
 
 // 复习队列：间隔重复——到期的词优先（按到期日排序）；没有到期词时回退到全部已学词（最久未复习的在前）
@@ -621,10 +541,12 @@ async function speakRussian(text, speed = 1) {
   const requestId = ++speechRequestSerial;
   stopActiveAudio();
   stopBrowserSpeech();
-  try {
-    await platformSpeech.stop();
-  } catch {
-    // Stopping is best-effort on devices whose TTS engine is still starting.
+  if (!isAndroid) {
+    try {
+      await platformSpeech.stop();
+    } catch {
+      // Stopping is best-effort on devices whose TTS engine is still starting.
+    }
   }
   if (requestId !== speechRequestSerial) return false;
   try {
@@ -692,16 +614,27 @@ function Nav({ active, onChange, goal }) {
 function AudioButton({ word, compact = false, text, className = "", speed = 1 }) {
   const spokenText = text || word?.stressed || "";
   const label = text || word?.word || "俄语内容";
+  const [loading, setLoading] = useState(false);
+  const requestSerial = useRef(0);
+  useEffect(() => () => { requestSerial.current += 1; }, []);
+  const play = async (event) => {
+    event.stopPropagation();
+    const requestId = ++requestSerial.current;
+    setLoading(true);
+    try {
+      await speakRussian(spokenText, speed);
+    } finally {
+      if (requestId === requestSerial.current) setLoading(false);
+    }
+  };
   return (
     <button
-      className={`audio-button ${compact ? "compact" : ""} ${className}`.trim()}
-      onClick={(event) => {
-        event.stopPropagation();
-        void speakRussian(spokenText, speed);
-      }}
+      className={`audio-button ${compact ? "compact" : ""} ${loading ? "is-loading" : ""} ${className}`.trim()}
+      onClick={(event) => void play(event)}
+      aria-busy={loading}
       aria-label={`播放 ${label} 发音`}
     >
-      <SpeakerHigh size={compact ? 17 : 21} weight="regular" />
+      <SpeakerHigh size={compact ? 17 : 21} weight={loading ? "fill" : "regular"} />
     </button>
   );
 }
@@ -764,7 +697,7 @@ function InteractiveExample({ text, wordIndex, speed = 1, className = "" }) {
     const half = width / 2;
     const left = Math.min(Math.max(rect.left + rect.width / 2, half + 16), window.innerWidth - half - 16);
     const top = rect.bottom + 176 < window.innerHeight ? rect.bottom + 10 : Math.max(12, rect.top - 166);
-    const entry = wordIndex?.get(cleanRussianText(token).toLocaleLowerCase("ru-RU")) || null;
+    const entry = resolveReadingWord(token, wordIndex)?.entry || null;
     setSelected({ partIndex, token, entry, left, top, width });
   };
 
@@ -866,6 +799,7 @@ function ReviewView({ queue, pool, settings, grammar, exampleWordIndex, sessionT
   const [selected, setSelected] = useState(null);
   const [showDetail, setShowDetail] = useState(false);
   const answerLocked = useRef(false);
+  const feedbackTimer = useRef(null);
   const total = sessionWords.length;
   const activeWord = sessionWords[index];
   const correct = mode === "meaning" ? activeWord?.meaning : activeWord?.word;
@@ -874,16 +808,19 @@ function ReviewView({ queue, pool, settings, grammar, exampleWordIndex, sessionT
     return createOptions(activeWord, pool, mode);
   }, [activeWord, mode, pool]);
 
+  useEffect(() => () => window.clearTimeout(feedbackTimer.current), []);
+
   const choose = (answer) => {
     if (answerLocked.current || selected !== null || !activeWord) return;
     answerLocked.current = true;
     const isCorrect = answer === correct;
     setSelected(answer);
     onAnswer?.(activeWord, sessionType, isCorrect, index + 1);
-    void (isCorrect ? haptics.success() : haptics.error());
-    setShowDetail(true);
+    window.clearTimeout(feedbackTimer.current);
+    feedbackTimer.current = window.setTimeout(() => setShowDetail(true), 96);
   };
   const next = () => {
+    window.clearTimeout(feedbackTimer.current);
     if (index >= total - 1) {
       onDone(total);
       return;
@@ -895,6 +832,7 @@ function ReviewView({ queue, pool, settings, grammar, exampleWordIndex, sessionT
   };
   const switchMode = (nextMode) => {
     if (nextMode === mode) return;
+    window.clearTimeout(feedbackTimer.current);
     answerLocked.current = false;
     setMode(nextMode);
     setSelected(null);
@@ -943,7 +881,7 @@ function ReviewView({ queue, pool, settings, grammar, exampleWordIndex, sessionT
         <div className={`answer-grid ${mode === "meaning" ? "meaning-options" : ""}`}>
           {options.map((option, optionIndex) => {
             const state = selected ? (option === correct ? "correct" : option === selected ? "wrong" : "muted") : "";
-            return <button key={`${option}-${optionIndex}`} className={`answer-option ${state}`} onClick={() => choose(option)}><span>{String.fromCharCode(65 + optionIndex)}.</span><strong>{option}</strong>{option === correct && selected ? <Check size={21} weight="bold" /> : option === selected && selected !== correct ? <X size={21} weight="bold" /> : null}</button>;
+            return <button key={`${option}-${optionIndex}`} className={`answer-option ${state}`} aria-pressed={selected === option} onClick={() => choose(option)}><span>{String.fromCharCode(65 + optionIndex)}.</span><strong>{option}</strong>{option === correct && selected ? <Check size={21} weight="bold" /> : option === selected && selected !== correct ? <X size={21} weight="bold" /> : null}</button>;
           })}
         </div>
       </div>
@@ -952,12 +890,85 @@ function ReviewView({ queue, pool, settings, grammar, exampleWordIndex, sessionT
 }
 
 const LIBRARY_PAGE_SIZE = 60;
+const CLOSE_LIBRARY_SHEET_EVENT = "russian-words:close-library-sheet";
 
-function LibraryView({ dictionaryWords, loading, settings, onSelectWord }) {
+function MobileWordSheet({ word, settings, grammar, exampleWordIndex, onClose }) {
+  const [tab, setTab] = useState("examples");
+  const collocations = Array.isArray(word.collocations) ? word.collocations : [];
+  const formItems = getFormItems(word).filter(({ form }) => form && cleanRussianText(form) !== cleanRussianText(word.stressed));
+
+  useEffect(() => {
+    const closeFromAppShell = () => onClose();
+    const closeOnEscape = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+    document.documentElement.classList.add("library-sheet-open");
+    window.addEventListener(CLOSE_LIBRARY_SHEET_EVENT, closeFromAppShell);
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      document.documentElement.classList.remove("library-sheet-open");
+      window.removeEventListener(CLOSE_LIBRARY_SHEET_EVENT, closeFromAppShell);
+      window.removeEventListener("keydown", closeOnEscape, true);
+    };
+  }, [onClose]);
+
+  return (
+    <div className="library-sheet-scrim" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="library-detail-dialog" role="dialog" aria-modal="true" aria-label={`${word.word} 的完整词条`}>
+        <span className="library-sheet-handle" aria-hidden="true" />
+        <header className="library-sheet-head">
+          <div>
+            <div className="library-sheet-word-line"><h2 lang="ru">{word.stressed}</h2><AudioButton word={word} speed={settings.speed} /></div>
+            <span className="library-sheet-meta">{[word.level, word.pos].filter(Boolean).join(" · ")}</span>
+          </div>
+          <button type="button" className="library-sheet-close-top" onClick={onClose} aria-label="关闭完整词条"><X size={24} /></button>
+        </header>
+
+        <div className="library-sheet-meaning">{word.meaning || (word.meaningEn ? `英译参考：${word.meaningEn}` : "中文释义待补充")}</div>
+        {word.meaningEn && <p className="library-sheet-english">{word.meaningEn}</p>}
+
+        <div className="library-sheet-tabs" role="tablist" aria-label="词条内容">
+          <button type="button" role="tab" aria-selected={tab === "examples"} className={tab === "examples" ? "active" : ""} onClick={() => setTab("examples")}>例句</button>
+          <button type="button" role="tab" aria-selected={tab === "collocations"} className={tab === "collocations" ? "active" : ""} onClick={() => setTab("collocations")}>搭配</button>
+          <button type="button" role="tab" aria-selected={tab === "forms"} className={tab === "forms" ? "active" : ""} onClick={() => setTab("forms")}>词形</button>
+        </div>
+
+        <div className="library-sheet-content">
+          {tab === "examples" && (word.example ? <div className="library-sheet-example">
+            <div className="library-sheet-russian-line"><InteractiveExample text={word.example} wordIndex={exampleWordIndex} speed={settings.speed} /><AudioButton text={word.example} compact speed={settings.speed} /></div>
+            <p>{word.translation || "暂无中文翻译"}</p>
+          </div> : <div className="library-sheet-empty">该词暂未收录例句。</div>)}
+
+          {tab === "collocations" && (collocations.length ? <div className="library-sheet-list">
+            {collocations.map((item, index) => <div key={`${item}-${index}`}>
+              <div className="library-sheet-russian-line"><InteractiveExample text={item} wordIndex={exampleWordIndex} speed={settings.speed} /><AudioButton text={item} compact speed={settings.speed} /></div>
+              <span>{COLLOCATION_MEANINGS[word.id]?.[index] || word.meaning}</span>
+            </div>)}
+          </div> : <div className="library-sheet-empty">该词暂未收录固定搭配。</div>)}
+
+          {tab === "forms" && (formItems.length ? <div className="library-sheet-list">
+            {formItems.map(({ form, meaning }) => <div key={form}>
+              <div className="library-sheet-russian-line"><strong lang="ru">{form}</strong><AudioButton text={form} compact speed={settings.speed} /></div>
+              <span>{meaning}</span>
+            </div>)}
+          </div> : grammar?.[word.word] ? <div className="library-sheet-grammar"><WordGrammarBlock word={word} grammar={grammar} speed={settings.speed} /></div> : <div className="library-sheet-empty">该词暂未收录更多词形。</div>)}
+        </div>
+
+        <button type="button" className="library-sheet-close-fab" onClick={onClose} aria-label="关闭"><X size={27} /></button>
+      </section>
+    </div>
+  );
+}
+
+function LibraryView({ dictionaryWords, loading, settings, grammar, exampleWordIndex, mobileMode, onSelectWord }) {
   const [query, setQuery] = useState("");
   const [level, setLevel] = useState("全部");
   const [page, setPage] = useState(1);
   const [pageInput, setPageInput] = useState("1");
+  const [expandedId, setExpandedId] = useState(null);
+  const [sheetWord, setSheetWord] = useState(null);
   const searchInput = useRef(null);
   const libraryList = useRef(null);
   useEffect(() => {
@@ -987,12 +998,14 @@ function LibraryView({ dictionaryWords, loading, settings, onSelectWord }) {
   const resetToFirstPage = () => {
     setPage(1);
     setPageInput("1");
+    setExpandedId(null);
   };
   const goToPage = (requestedPage) => {
     const parsed = Number.parseInt(requestedPage, 10);
     const nextPage = paginateItems(filtered, Number.isFinite(parsed) ? parsed : currentPage, LIBRARY_PAGE_SIZE).page;
     setPage(nextPage);
     setPageInput(String(nextPage));
+    setExpandedId(null);
     if (nextPage !== currentPage) requestAnimationFrame(() => libraryList.current?.scrollIntoView({ block: "start" }));
   };
   const levels = ["全部", "A1", "A2", "B1", "B2"];
@@ -1002,7 +1015,20 @@ function LibraryView({ dictionaryWords, loading, settings, onSelectWord }) {
       <label className="search-box"><MagnifyingGlass size={22} /><input ref={searchInput} value={query} onChange={(event) => { setQuery(event.target.value); resetToFirstPage(); }} placeholder="搜索俄语单词或中文释义" /><kbd>Ctrl K</kbd></label>
       <div className="library-meta"><span>{loading ? "词库加载中…" : `${pagination.totalItems} 个词条 · 第 ${currentPage} / ${pagination.totalPages} 页`}</span><div>{levels.map((item) => <button key={item} className={`filter-chip ${level === item ? "active" : ""}`} onClick={() => { setLevel(item); resetToFirstPage(); }}>{item}</button>)}</div></div>
       <div className="library-list" ref={libraryList}>
-        {visibleWords.map((word) => <div className="library-row" role="button" tabIndex={0} key={word.id} onClick={() => onSelectWord(word)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelectWord(word); } }}><span className="library-word">{word.stressed}<AudioButton word={word} compact speed={settings.speed} /></span><span>{word.meaning || (word.meaningEn ? `英译参考：${word.meaningEn}` : "中文释义待补充")}</span><span className="level-tag">{word.level}</span><span className="library-arrow">→</span></div>)}
+        {visibleWords.map((word) => {
+          if (!mobileMode) return <div className="library-row" role="button" tabIndex={0} key={word.id} onClick={() => onSelectWord(word)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelectWord(word); } }}><span className="library-word">{word.stressed}<AudioButton word={word} compact speed={settings.speed} /></span><span>{word.meaning || (word.meaningEn ? `英译参考：${word.meaningEn}` : "中文释义待补充")}</span><span className="level-tag">{word.level}</span><span className="library-arrow">→</span></div>;
+          const expanded = expandedId === word.id;
+          return <article className={`library-mobile-card ${expanded ? "expanded" : ""}`} key={word.id}>
+            <div className="library-mobile-summary" role="button" tabIndex={0} aria-expanded={expanded} onClick={() => setExpandedId((current) => current === word.id ? null : word.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setExpandedId((current) => current === word.id ? null : word.id); } }}>
+              <span className="library-word" lang="ru">{word.stressed}<AudioButton word={word} compact speed={settings.speed} /></span>
+              <span className="level-tag">{word.level}</span>
+            </div>
+            {expanded && <div className="library-mobile-reveal">
+              <div><strong>{word.meaning || (word.meaningEn ? `英译参考：${word.meaningEn}` : "中文释义待补充")}</strong>{word.pos && <span>{word.pos}</span>}</div>
+              <button type="button" className="library-lookup-button" onClick={() => setSheetWord(word)} aria-label={`查看 ${word.word} 的完整词条`}><MagnifyingGlass size={22} /><span>详解</span></button>
+            </div>}
+          </article>;
+        })}
         {!filtered.length && !loading && <div className="empty-state">没有找到匹配的单词。</div>}
       </div>
       {pagination.totalItems > 0 && <nav className="library-pagination" aria-label="词库分页">
@@ -1010,6 +1036,7 @@ function LibraryView({ dictionaryWords, loading, settings, onSelectWord }) {
         <label className="pagination-jump"><span>第</span><input type="number" min="1" max={pagination.totalPages} inputMode="numeric" value={pageInput} onChange={(event) => setPageInput(event.target.value)} onBlur={() => goToPage(pageInput)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); goToPage(pageInput); event.currentTarget.blur(); } }} aria-label="跳转页码" /><span>/ {pagination.totalPages} 页</span><small>{pagination.start + 1}–{pagination.end} / {pagination.totalItems}</small></label>
         <button type="button" className="pagination-button" disabled={currentPage === pagination.totalPages} onClick={() => goToPage(currentPage + 1)}>下一页 →</button>
       </nav>}
+      {sheetWord && <MobileWordSheet word={sheetWord} settings={settings} grammar={grammar} exampleWordIndex={exampleWordIndex} onClose={() => setSheetWord(null)} />}
     </div>
   );
 }
@@ -1373,7 +1400,7 @@ function ProfileView({ stats, settings, onNavigate }) {
   );
 }
 
-function SettingsView({ settings, onChange, backgroundImage, onChooseBackground, onClearBackground, onResetData }) {
+function SettingsView({ settings, onChange, backgroundImage, onChooseBackground, onClearBackground }) {
   const fileInput = useRef(null);
   const chooseFromFile = (event) => {
     const file = event.target.files?.[0];
@@ -1389,7 +1416,7 @@ function SettingsView({ settings, onChange, backgroundImage, onChooseBackground,
     if (isAndroid || window.desktopApp?.selectBackgroundImage) void onChooseBackground();
     else fileInput.current?.click();
   };
-  return <div className="page-content settings-page"><span className="eyebrow">设置</span><h1>学习偏好</h1><div className="settings-list"><label><span><strong>每日新词</strong></span><select value={settings.dailyGoal} onChange={(event) => onChange({ ...settings, dailyGoal: Number(event.target.value) })}><option value="10">10</option><option value="20">20</option><option value="30">30</option></select></label><label><span><strong>发音速度</strong></span><select value={settings.speed} onChange={(event) => onChange({ ...settings, speed: Number(event.target.value), speedProfileVersion: 2 })}><option value="0.82">慢速</option><option value="1">标准</option><option value="1.15">快速</option></select></label><label><span><strong>听音辨词</strong></span><button type="button" role="switch" aria-checked={settings.listenEnabled} className={`toggle ${settings.listenEnabled ? "on" : ""}`} onClick={() => onChange({ ...settings, listenEnabled: !settings.listenEnabled })}><span /></button></label><div className="background-setting"><div><strong>应用背景</strong></div><div className="background-actions"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={chooseFromFile} /><button className="secondary-button" onClick={chooseImage}>{backgroundImage ? "更换图片" : "导入图片"}</button>{backgroundImage && <button className="text-button" onClick={onClearBackground}>恢复默认</button>}</div></div><div className="background-setting"><div><strong>学习数据</strong></div><div className="background-actions"><button className="danger-button" onClick={onResetData}>清空学习数据</button></div></div></div></div>;
+  return <div className="page-content settings-page"><span className="eyebrow">设置</span><h1>学习偏好</h1><div className="settings-list"><label><span><strong>每日新词</strong></span><select value={settings.dailyGoal} onChange={(event) => onChange({ ...settings, dailyGoal: Number(event.target.value) })}><option value="10">10</option><option value="20">20</option><option value="30">30</option></select></label><label><span><strong>发音速度</strong></span><select value={settings.speed} onChange={(event) => onChange({ ...settings, speed: Number(event.target.value), speedProfileVersion: 2 })}><option value="0.82">慢速</option><option value="1">标准</option><option value="1.15">快速</option></select></label><label><span><strong>听音辨词</strong></span><button type="button" role="switch" aria-checked={settings.listenEnabled} className={`toggle ${settings.listenEnabled ? "on" : ""}`} onClick={() => onChange({ ...settings, listenEnabled: !settings.listenEnabled })}><span /></button></label><div className="background-setting"><div><strong>应用背景</strong></div><div className="background-actions"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={chooseFromFile} /><button className="secondary-button" onClick={chooseImage}>{backgroundImage ? "更换图片" : "导入图片"}</button>{backgroundImage && <button className="text-button" onClick={onClearBackground}>恢复默认</button>}</div></div></div></div>;
 }
 
 export function App() {
@@ -1408,6 +1435,7 @@ export function App() {
   const [selectedWord, setSelectedWord] = useState(null);
   const [backgroundImage, setBackgroundImage] = useState("");
   const [lookupWords, setLookupWords] = useState(null);
+  const [rankedStudyWords, setRankedStudyWords] = useState(null);
   const [examples, setExamples] = useState(null);
   const [grammar, setGrammar] = useState(null);
 
@@ -1475,13 +1503,17 @@ export function App() {
   useEffect(() => {
     let mounted = true;
     Promise.all([
-      import("./data/open-russian-lookup.json"),
+      import("./data/russian-core-5000.json"),
+      isAndroidBuild ? Promise.resolve(null) : (isAndroid ? Promise.resolve(null) : import("./data/open-russian-lookup.json")),
       import("./data/russian-examples.json").catch(() => null),
+      import("./data/russian-example-overrides.json").catch(() => null),
       import("./data/russian-grammar.json").catch(() => null),
-    ]).then(([lookupModule, examplesModule, grammarModule]) => {
+    ]).then(([rankedStudyModule, lookupModule, examplesModule, exampleOverridesModule, grammarModule]) => {
       if (!mounted) return;
-      setLookupWords(lookupModule.default);
-      setExamples(examplesModule?.default || null);
+      const rankedWords = rankedStudyModule.default;
+      setLookupWords(useMobileCoreDataset ? rankedWords : lookupModule.default);
+      setRankedStudyWords(rankedWords);
+      setExamples({ ...(examplesModule?.default || {}), ...(exampleOverridesModule?.default || {}) });
       setGrammar(grammarModule?.default || null);
     }).catch(() => {
       // Library and study pool fall back to the bundled local words.
@@ -1497,10 +1529,16 @@ export function App() {
     }).catch(() => {});
   }, []);
 
-  const pool = useMemo(() => buildCoreStudyPool(WORDS, lookupWords, examples), [lookupWords, examples]);
-  const dictionaryWords = useMemo(() => buildCoreDictionary(WORDS, lookupWords, examples), [lookupWords, examples]);
-  const exampleWordIndex = useMemo(() => buildExampleWordIndex(dictionaryWords, grammar), [dictionaryWords, grammar]);
+  const pool = useMemo(
+    () => buildCoreStudyPool(WORDS, lookupWords, examples, rankedStudyWords),
+    [lookupWords, examples, rankedStudyWords],
+  );
+  const dictionaryWords = useMemo(
+    () => useMobileCoreDataset && rankedStudyWords?.length ? pool : buildCoreDictionary(WORDS, lookupWords, examples),
+    [pool, lookupWords, examples, rankedStudyWords],
+  );
   const readingWordIndex = useMemo(() => buildReadingWordIndex(dictionaryWords, grammar), [dictionaryWords, grammar]);
+  const exampleWordIndex = readingWordIndex;
   const readingSpeechController = useMemo(() => createReadingSpeechController({
     speak: (text) => speakRussian(text, settings.speed),
     stop: stopRussianSpeech,
@@ -1536,6 +1574,11 @@ export function App() {
       window.dispatchEvent(new Event("reading:close-popover"));
       return true;
     };
+    const closeLibrarySheet = () => {
+      if (!document.querySelector(".library-detail-dialog")) return false;
+      window.dispatchEvent(new Event(CLOSE_LIBRARY_SHEET_EVENT));
+      return true;
+    };
     const goBack = () => {
       if (active === "learn" || active === "review") {
         if (studySession === "practice") setActive("library");
@@ -1556,7 +1599,7 @@ export function App() {
     };
     const handleBackIntent = (event) => {
       if (event.type === "keydown" && event.key !== "Escape") return;
-      if (closeReadingPopover() || closeExamplePopover()) {
+      if (closeLibrarySheet() || closeReadingPopover() || closeExamplePopover()) {
         event.preventDefault?.();
         event.stopImmediatePropagation?.();
         return;
@@ -1569,7 +1612,7 @@ export function App() {
       if (goBack()) event.preventDefault?.();
     };
     void system.onBackButton(() => {
-      if (closeReadingPopover() || closeExamplePopover()) return;
+      if (closeLibrarySheet() || closeReadingPopover() || closeExamplePopover()) return;
       if (wasExamplePopoverJustClosed()) return;
       if (!goBack()) system.exitApp();
     }).then((remove) => {
@@ -1605,21 +1648,6 @@ export function App() {
       // The local UI state is still cleared if the platform file is unavailable.
     }
     setBackgroundImage("");
-  };
-  const resetStudyData = async () => {
-    if (!window.confirm("确定要清空所有学习数据吗？已学单词、复习进度和今日加入的词都会被清除，此操作不可撤销。")) return;
-    try {
-      await Promise.all([
-        STUDY_PROGRESS_KEY,
-        STUDY_RECORD_KEY,
-        ADDED_TODAY_KEY,
-      ].map((key) => platformStorage.remove(key)));
-    } catch {
-      // State is still reset for the current app session if storage is unavailable.
-    }
-    setSessions({});
-    setRecord({ version: SCHEMA_VERSION, words: {} });
-    setAddedToday(normalizeAddedToday(null, todayKey()));
   };
 
   const goToWord = (word) => {
@@ -1690,11 +1718,11 @@ export function App() {
   } else if (active === "reading") {
     content = <ReadingView texts={readingTexts} resolveWord={resolveReadingEntry} onSpeak={speakReadingText} onStop={stopReading} />;
   } else if (active === "library") {
-    content = <LibraryView dictionaryWords={dictionaryWords} loading={!lookupWords} settings={settings} onSelectWord={goToWord} />;
+    content = <LibraryView dictionaryWords={dictionaryWords} loading={!lookupWords} settings={settings} grammar={grammar} exampleWordIndex={exampleWordIndex} mobileMode={useMobileCoreDataset} onSelectWord={goToWord} />;
   } else if (active === "history") {
     content = <HistoryView stats={historyStats} days={historyDays} />;
   } else if (active === "settings") {
-    content = <SettingsView settings={settings} onChange={setSettings} backgroundImage={backgroundImage} onChooseBackground={chooseBackground} onClearBackground={clearBackground} onResetData={resetStudyData} />;
+    content = <SettingsView settings={settings} onChange={setSettings} backgroundImage={backgroundImage} onChooseBackground={chooseBackground} onClearBackground={clearBackground} />;
   } else if (active === "profile") {
     content = <ProfileView stats={historyStats} settings={settings} onNavigate={navigate} />;
   } else {

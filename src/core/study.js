@@ -1,4 +1,4 @@
-import { SCHEMA_VERSION, SESSION_TYPES } from "./constants.js";
+import { SCHEMA_VERSION, SESSION_ORDER_VERSION, SESSION_TYPES } from "./constants.js";
 import { dateKey, isDateKey } from "./dates.js";
 
 export function normalizeRecord(value) {
@@ -55,6 +55,7 @@ export function createSession(sessionType, queue, today = dateKey()) {
   if (!SESSION_TYPES.includes(sessionType)) throw new TypeError(`Unknown session type: ${sessionType}`);
   return {
     version: SCHEMA_VERSION,
+    orderVersion: SESSION_ORDER_VERSION,
     type: sessionType,
     date: today,
     queueIds: (queue || []).map((word) => typeof word === "string" ? word : word.id).filter(Boolean),
@@ -74,9 +75,22 @@ export function normalizeSession(value, sessionType, queue, today = dateKey()) {
   const appended = queueIds.filter((id) => !storedQueue.includes(id));
   const completedIds = [...new Set((value.completedIds || []).filter((id) => available.has(id)))];
   const completed = new Set(completedIds);
+  if (value.orderVersion !== SESSION_ORDER_VERSION) {
+    const completedPrefix = storedQueue.filter((id) => completed.has(id));
+    const missingCompleted = completedIds.filter((id) => !completedPrefix.includes(id));
+    const pending = queueIds.filter((id) => !completed.has(id));
+    const reconciled = [...completedPrefix, ...missingCompleted, ...pending];
+    return {
+      ...value,
+      orderVersion: SESSION_ORDER_VERSION,
+      queueIds: reconciled,
+      completedIds,
+      cursor: completedPrefix.length + missingCompleted.length,
+    };
+  }
   const reconciled = [...storedQueue, ...appended];
   const firstPending = reconciled.findIndex((id) => !completed.has(id));
-  return { ...value, queueIds: reconciled, completedIds, cursor: firstPending < 0 ? reconciled.length : firstPending };
+  return { ...value, orderVersion: SESSION_ORDER_VERSION, queueIds: reconciled, completedIds, cursor: firstPending < 0 ? reconciled.length : firstPending };
 }
 
 export function completeSessionWord(session, wordId) {

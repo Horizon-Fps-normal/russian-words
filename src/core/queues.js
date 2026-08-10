@@ -12,32 +12,21 @@ export function addWordForToday(state, wordId, today = dateKey()) {
   return current.wordIds.includes(wordId) ? current : { ...current, wordIds: [...current.wordIds, wordId] };
 }
 
-function posGroup(pos) {
-  return String(pos || "其他").split(" · ")[0] || "其他";
-}
-
-function meaningSegments(meaning) {
-  return new Set(String(meaning || "").split(/[；;，,、\s]+/).filter(Boolean));
-}
-
-function meaningsOverlap(a, b) {
-  const aSegments = meaningSegments(a);
-  return [...meaningSegments(b)].some((segment) => aSegments.has(segment));
-}
-
-function dateSeededRandom(today) {
-  let seed = 2166136261;
-  for (const char of today) {
-    seed ^= char.charCodeAt(0);
-    seed = Math.imul(seed, 16777619);
+function stableHash(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
   }
-  return () => {
-    seed += 0x6D2B79F5;
-    let value = seed;
-    value = Math.imul(value ^ (value >>> 15), value | 1);
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
-  };
+  return hash >>> 0;
+}
+
+export function shuffleStudyWords(words, seed) {
+  return [...(words || [])].sort((left, right) => {
+    const leftId = String(left?.id || left?.word || "");
+    const rightId = String(right?.id || right?.word || "");
+    return stableHash(`${seed}\0${leftId}`) - stableHash(`${seed}\0${rightId}`) || leftId.localeCompare(rightId);
+  });
 }
 
 export function buildLearnQueue(pool, record, addedToday, today = dateKey()) {
@@ -45,51 +34,11 @@ export function buildLearnQueue(pool, record, addedToday, today = dateKey()) {
   const byId = new Map((pool || []).map((word) => [word.id, word]));
   const added = wordIds.map((id) => byId.get(id)).filter(Boolean);
   const addedIds = new Set(added.map((word) => word.id));
-  const unlearned = (pool || []).filter((word) => !record?.words?.[word.id]?.learnedAt && !addedIds.has(word.id));
-  const random = dateSeededRandom(today);
-  const levels = new Map();
-  for (const word of unlearned) {
-    const level = word.level || "其他";
-    if (!levels.has(level)) levels.set(level, new Map());
-    const groups = levels.get(level);
-    const group = posGroup(word.pos);
-    if (!groups.has(group)) groups.set(group, []);
-    groups.get(group).push(word);
-  }
-  for (const groups of levels.values()) {
-    for (const bucket of groups.values()) {
-      for (let index = bucket.length - 1; index > 0; index -= 1) {
-        const swap = Math.floor(random() * (index + 1));
-        [bucket[index], bucket[swap]] = [bucket[swap], bucket[index]];
-      }
-    }
-  }
-  const queue = [];
-  let lastMeaning = "";
-  for (const groups of levels.values()) {
-    const names = [...groups.keys()];
-    const cursors = new Map(names.map((name) => [name, 0]));
-    let remaining = [...groups.values()].reduce((sum, bucket) => sum + bucket.length, 0);
-    while (remaining > 0) {
-      for (const name of names) {
-        const bucket = groups.get(name);
-        const cursor = cursors.get(name);
-        if (cursor >= bucket.length) continue;
-        let pickIndex = cursor;
-        if (lastMeaning) {
-          const offset = bucket.slice(cursor).findIndex((word) => !meaningsOverlap(word.meaning, lastMeaning));
-          if (offset >= 0) pickIndex = cursor + offset;
-        }
-        [bucket[cursor], bucket[pickIndex]] = [bucket[pickIndex], bucket[cursor]];
-        const picked = bucket[cursor];
-        cursors.set(name, cursor + 1);
-        remaining -= 1;
-        lastMeaning = picked.meaning;
-        queue.push(picked);
-      }
-    }
-  }
-  return [...added, ...queue];
+  const unlearned = shuffleStudyWords(
+    (pool || []).filter((word) => !record?.words?.[word.id]?.learnedAt && !addedIds.has(word.id)),
+    `learn-${today}`,
+  );
+  return [...added, ...unlearned];
 }
 
 export function reviewDueDate(entry) {

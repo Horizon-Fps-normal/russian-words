@@ -51,6 +51,22 @@ test("pool merge preserves local priority, content, ordering and does not mutate
   assert.equal(buildDictionary(local, [{ id: "x", word: "слово", meaning: "" }]).length, 2);
 });
 
+test("ranked study data limits the pool and keeps rank order, compact meanings and duplicate senses", () => {
+  const local = [{ id: "local-a", word: "что", meaning: "什么", level: "A1" }];
+  const lookup = [{ id: "lookup-b", word: "дом", meaning: "房屋的详细词典定义", level: "A1", pos: "名词" }];
+  const ranked = [
+    { id: "lookup-b", word: "дом", lookupWord: "дом", meaning: "家；房子", studyRank: 1 },
+    { id: "local-a", word: "что", meaning: "（连接词）……的", studyRank: 2 },
+    { id: "core5000-3", word: "что", meaning: "什么", studyRank: 3 },
+  ];
+  const pool = buildStudyPool(local, lookup, null, ranked);
+  assert.equal(pool.length, 3);
+  assert.deepEqual(pool.map((word) => word.studyRank), [1, 2, 3]);
+  assert.equal(pool[0].pos, "名词");
+  assert.equal(pool[0].meaning, "家；房子");
+  assert.deepEqual(pool.slice(1).map((word) => word.id), ["local-a", "core5000-3"]);
+});
+
 test("dictionary search includes the actual meaningEn field", () => {
   const dictionary = [{ id: "x", word: "слово", stressed: "сло́во", meaning: "", meaningEn: "word", level: "A1" }];
   assert.deepEqual(searchDictionary(dictionary, "word").map((word) => word.id), ["x"]);
@@ -95,25 +111,14 @@ test("example lookup tokenizes Russian text and resolves inflected grammar forms
   assert.deepEqual(splitRussianText("по-русски"), [{ text: "по-русски", isRussian: true }]);
 });
 
-test("today-added words expire by date, lead queue and daily goal never caps queue", () => {
+test("unlearned words use a stable daily shuffle while today-added words stay first", () => {
   const state = addWordForToday(null, "c", "2026-08-06");
   const record = { words: { a: { learnedAt: "2026-08-05" } } };
-  assert.deepEqual(buildLearnQueue(words, record, state, "2026-08-06").map((word) => word.id), ["c", "b", "d"]);
-  assert.deepEqual(buildLearnQueue(words, record, state, "2026-08-07").map((word) => word.id), ["b", "c", "d"]);
+  const first = buildLearnQueue(words, record, state, "2026-08-06").map((word) => word.id);
+  assert.deepEqual(first, ["c", "d", "b"]);
+  assert.deepEqual(buildLearnQueue(words, record, state, "2026-08-06").map((word) => word.id), first);
+  assert.deepEqual(buildLearnQueue(words, record, state, "2026-08-07").map((word) => word.id), ["d", "c", "b"]);
   assert.equal(buildLearnQueue(Array.from({ length: 31 }, (_, id) => ({ id: String(id) })), { words: {} }, null, "2026-08-06").length, 31);
-});
-
-test("learn queue is stable within a day and interleaves parts of speech", () => {
-  const mixed = [
-    { id: "n1", word: "дом", meaning: "家", level: "A1", pos: "名词 · 阳性" },
-    { id: "n2", word: "стол", meaning: "桌子", level: "A1", pos: "名词 · 阳性" },
-    { id: "v1", word: "читать", meaning: "阅读", level: "A1", pos: "动词 · 未完成体" },
-    { id: "v2", word: "писать", meaning: "写", level: "A1", pos: "动词 · 未完成体" },
-  ];
-  const first = buildLearnQueue(mixed, { words: {} }, null, "2026-08-06");
-  const second = buildLearnQueue(mixed, { words: {} }, null, "2026-08-06");
-  assert.deepEqual(first.map((word) => word.id), second.map((word) => word.id));
-  assert.deepEqual(first.map((word) => word.pos.split(" · ")[0]), ["名词", "动词", "名词", "动词"]);
 });
 
 test("SRS uses 1/3/7/14/30/90 days and caps later stages", () => {
@@ -175,6 +180,14 @@ test("versioned queue snapshots discard legacy offsets and reconcile by IDs", ()
   const reordered = normalizeSession(session, "learn", [words[3], words[1], words[0]], "2026-08-06");
   assert.equal(reordered.queueIds[reordered.cursor], "b");
   assert.deepEqual(reordered.completedIds, ["a"]);
+
+  const oldOrderedSession = { ...session };
+  delete oldOrderedSession.orderVersion;
+  const migrated = normalizeSession(oldOrderedSession, "learn", [words[3], words[1], words[0]], "2026-08-06");
+  assert.equal(migrated.orderVersion, 2);
+  assert.deepEqual(migrated.completedIds, ["a"]);
+  assert.deepEqual(migrated.queueIds, ["a", "d", "b"]);
+  assert.equal(migrated.queueIds[migrated.cursor], "d");
 });
 
 test("answer options support both modes and remain unique", () => {
@@ -184,19 +197,6 @@ test("answer options support both modes and remain unique", () => {
   assert.ok(meanings.includes("灯塔"));
   assert.ok(listening.includes("маяк"));
   assert.equal(new Set(meanings).size, meanings.length);
-});
-
-test("meaning options avoid overlapping glosses when enough alternatives exist", () => {
-  const pool = [
-    { id: "correct", word: "и", meaning: "和；与" },
-    { id: "overlap", word: "да", meaning: "和" },
-    { id: "safe-1", word: "дом", meaning: "房子" },
-    { id: "safe-2", word: "читать", meaning: "阅读" },
-    { id: "safe-3", word: "быстро", meaning: "快速地" },
-  ];
-  const options = createOptions(pool[0], pool, "meaning", () => 0.5);
-  assert.ok(options.includes("和；与"));
-  assert.ok(!options.includes("和"));
 });
 
 test("history counts study/review/practice activity in streak and all attempts in accuracy", () => {

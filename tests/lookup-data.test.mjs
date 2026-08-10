@@ -65,3 +65,15 @@ test("OpenRussian lookup has complete, non-self glosses and stable identities", 
     assert.equal(byWord.get(word)?.meaning, meaning, `${word} should have a reviewed Chinese gloss`);
   }
 });
+
+test("ranked study pool contains exactly 5000 concise meanings", async () => {
+  const entries = JSON.parse(await readFile("src/data/russian-core-5000.json", "utf8"));
+  assert.equal(entries.length, 5000);
+  assert.deepEqual(entries.map((entry) => entry.studyRank), Array.from({ length: 5000 }, (_, index) => index + 1));
+  assert.equal(new Set(entries.map((entry) => entry.id)).size, 5000);
+  assert.ok(entries.every((entry) => entry.meaning && entry.meaning.length <= 32));
+  assert.ok(entries.every((entry) => /\p{Script=Han}/u.test(entry.meaning)));
+  assert.ok(entries.every((entry) => !/[\p{Script=Latin}\p{Script=Cyrillic}]/u.test(entry.meaning)));
+  assert.equal(entries.find((entry) => entry.word === "зря")?.meaning, "白费；徒然；不该");
+  assert.equal(entries.find((entry) => entry.word === "честно")?.meaning, "诚实地；坦率地；公平地");
+});

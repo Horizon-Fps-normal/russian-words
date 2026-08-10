@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BookOpen, CaretDown, CaretUp, SpeakerHigh, X } from "@phosphor-icons/react";
 import { filterReadingTexts, normalizeReadingTexts, READING_LEVELS, tokenizeReadingRussian } from "../core/reading.js";
+import PhrasebookView from "./PhrasebookView.jsx";
 import "../styles-reading.css";
 
 function anchorPosition(target, preferredWidth = 340) {
@@ -30,6 +31,7 @@ function articleMeta(article) {
 
 export default function ReadingView({ texts = [], resolveWord, onSpeak, onStop }) {
   const articles = useMemo(() => normalizeReadingTexts(texts), [texts]);
+  const [mode, setMode] = useState("articles");
   const [level, setLevel] = useState("全部");
   const filtered = useMemo(() => filterReadingTexts(articles, level), [articles, level]);
   const [selectedId, setSelectedId] = useState(null);
@@ -135,17 +137,26 @@ export default function ReadingView({ texts = [], resolveWord, onSpeak, onStop }
 
   const entry = popup?.type === "word" ? popup.entry : null;
   const baseWord = entry?.stressed || popup?.lemma || entry?.word || entry?.lemma || "";
+  const changeMode = (nextMode) => {
+    onStop?.();
+    closePopup(false);
+    setMode(nextMode);
+  };
 
   return (
     <section className="reading-view" aria-label="俄语阅读">
       <header className="reading-header">
-        <div><span className="reading-eyebrow">阅读</span><h1>俄语文章</h1></div>
-        <div className="reading-chips" role="group" aria-label="阅读等级筛选">
-          {["全部", ...READING_LEVELS].map((item) => <button type="button" key={item} className={level === item ? "active" : ""} onClick={() => { setLevel(item); setSelectedId(null); setTranslationOpen(false); closePopup(false); }}>{item}</button>)}
+        <div><span className="reading-eyebrow">阅读</span><h1>{mode === "articles" ? "俄语文章" : "短语大全"}</h1></div>
+        <div className="reading-mode-switch" role="tablist" aria-label="阅读内容">
+          <button type="button" role="tab" aria-selected={mode === "articles"} className={mode === "articles" ? "active" : ""} onClick={() => changeMode("articles")}>文章</button>
+          <button type="button" role="tab" aria-selected={mode === "phrases"} className={mode === "phrases" ? "active" : ""} onClick={() => changeMode("phrases")}>短语大全</button>
         </div>
+        {mode === "articles" && <div className="reading-chips" role="group" aria-label="阅读等级筛选">
+          {["全部", ...READING_LEVELS].map((item) => <button type="button" key={item} className={level === item ? "active" : ""} onClick={() => { setLevel(item); setSelectedId(null); setTranslationOpen(false); closePopup(false); }}>{item}</button>)}
+        </div>}
       </header>
 
-      {!articles.length ? <div className="reading-empty"><BookOpen size={34} /><p>暂无阅读文章。</p></div> : !filtered.length ? <div className="reading-empty"><p>该难度暂无文章。</p></div> : (
+      {mode === "phrases" ? <PhrasebookView onSpeak={onSpeak} onStop={onStop} /> : !articles.length ? <div className="reading-empty"><BookOpen size={34} /><p>暂无阅读文章。</p></div> : !filtered.length ? <div className="reading-empty"><p>该难度暂无文章。</p></div> : (
         <div className="reading-layout">
           <aside className="reading-list" aria-label="文章列表">
             {filtered.map((article) => <button type="button" key={article.id} className={selectedArticle?.id === article.id ? "active" : ""} onClick={() => changeArticle(article)} aria-current={selectedArticle?.id === article.id ? "page" : undefined}>

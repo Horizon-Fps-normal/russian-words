@@ -114,12 +114,17 @@ test("reading lookup resolves direct forms, grammar forms and conservative lemma
     { word: "работа", stressed: "рабо́та", meaning: "工作", forms: "работа · работу" },
     { word: "интересный", meaning: "有趣的" },
     { word: "книга", meaning: "书" },
+    { word: "театр", meaning: "剧院" },
+    { word: "курить", meaning: "抽烟；吸烟" },
   ];
   const grammar = { "работа": { declension: { prepositional: "работе", instrumentalPlural: "работами" } } };
   const index = buildReadingWordIndex(words, grammar);
   assert.equal(resolveReadingWord("рабо́ту", index).lemma, "работа");
   assert.equal(resolveReadingWord("работами", index).lemma, "работа");
   assert.equal(resolveReadingWord("интересная", index).lemma, "интересный");
+  assert.equal(resolveReadingWord("театру", index).lemma, "театр");
+  assert.equal(resolveReadingWord("курит", index).lemma, "курить");
+  assert.equal(resolveReadingWord("курю", index).lemma, "курить");
   assert.ok(readingLemmaCandidates("книги").includes("книга"));
   const tokens = tokenizeReadingText("Я читаю книги.", index);
   assert.equal(tokens.map((item) => item.text).join(""), "Я читаю книги.");

@@ -1,4 +1,5 @@
 export const SCHEMA_VERSION = 2;
+export const SESSION_ORDER_VERSION = 2;
 
 export const SESSION_TYPES = Object.freeze(["learn", "review", "practice"]);
 export const QUIZ_MODES = Object.freeze(["meaning", "listen"]);

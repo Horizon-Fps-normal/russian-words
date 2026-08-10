@@ -1,7 +1,6 @@
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import { Preferences } from "@capacitor/preferences";
 import { App } from "@capacitor/app";
-import { Haptics, ImpactStyle, NotificationType } from "@capacitor/haptics";
 import { StatusBar, Style } from "@capacitor/status-bar";
 
 const RussianWords = registerPlugin("RussianWords");
@@ -99,17 +98,6 @@ export const background = {
     if (isAndroid) await RussianWords.clearBackgroundImage();
     else await window.desktopApp?.clearBackgroundImage?.();
   },
-};
-
-async function haptic(action) {
-  if (!isAndroid) return;
-  try { await action(); } catch { /* Devices may disable vibration. */ }
-}
-
-export const haptics = {
-  selection: () => haptic(() => Haptics.impact({ style: ImpactStyle.Light })),
-  success: () => haptic(() => Haptics.notification({ type: NotificationType.Success })),
-  error: () => haptic(() => Haptics.notification({ type: NotificationType.Error })),
 };
 
 export const system = {

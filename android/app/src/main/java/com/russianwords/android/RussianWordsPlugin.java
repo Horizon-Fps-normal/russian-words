@@ -101,17 +101,23 @@ public class RussianWordsPlugin extends Plugin {
             synchronized (RussianWordsPlugin.this) {
                 if (!isCurrentRequest(requestId, call)) return;
                 try {
-                    edgePlayer = new MediaPlayer();
-                    edgePlayer.setDataSource(audio.getAbsolutePath());
-                    edgePlayer.setOnCompletionListener(player -> releaseEdgePlayer(player));
-                    edgePlayer.setOnErrorListener((player, what, extra) -> {
-                        releaseEdgePlayer(player);
+                    MediaPlayer player = new MediaPlayer();
+                    edgePlayer = player;
+                    player.setDataSource(audio.getAbsolutePath());
+                    player.setOnPreparedListener(prepared -> {
+                        synchronized (RussianWordsPlugin.this) {
+                            if (!isCurrentRequest(requestId, call) || edgePlayer != prepared) return;
+                            prepared.start();
+                            resolveSpeechCall(call, true, "edge-svetlana");
+                        }
+                    });
+                    player.setOnCompletionListener(this::releaseEdgePlayer);
+                    player.setOnErrorListener((failed, what, extra) -> {
+                        releaseEdgePlayer(failed);
                         fallbackToSystem(text, speed, requestId, call);
                         return true;
                     });
-                    edgePlayer.prepare();
-                    edgePlayer.start();
-                    resolveSpeechCall(call, true, "edge-svetlana");
+                    player.prepareAsync();
                 } catch (Exception error) {
                     releaseEdgePlayer(edgePlayer);
                     fallbackToSystem(text, speed, requestId, call);
